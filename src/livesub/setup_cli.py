@@ -175,6 +175,7 @@ def create_shortcuts(project: Path) -> list[str]:
     made = []
     # 桌面用 Known Folder 取得（OneDrive 備份會把桌面搬到 OneDrive\桌面）；路徑都用環境變數傳，避免引號問題
     ps = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"  # 否則中文路徑以 cp950 輸出，回讀會亂碼
         "$d=[Environment]::GetFolderPath($env:LS_FOLDER);if(-not $d){exit 3};"
         "$p=Join-Path $d '即時字幕.lnk';$w=New-Object -ComObject WScript.Shell;$l=$w.CreateShortcut($p);"
         "$l.TargetPath=$env:LS_TARGET;$l.Arguments='-m livesub';$l.WorkingDirectory=$env:LS_CWD;"

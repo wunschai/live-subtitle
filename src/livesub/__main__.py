@@ -64,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
             print(e, file=sys.stderr)
         return 2
 
+    logging.getLogger("livesub").info("啟動：等級 %s（%s），ASR %s，設定 %s", profile.name, profile.label,
+                                      profile.asr_model, args.config or "預設")
     qapp = QApplication(sys.argv[:1])
     qapp.setApplicationName("即時字幕")
     qapp.setQuitOnLastWindowClosed(False)
