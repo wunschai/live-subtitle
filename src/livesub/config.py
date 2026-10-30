@@ -52,7 +52,8 @@ class DisplaySettings:
 
 @dataclass
 class RuntimeSettings:
-    profile: str = ""  # 安裝時寫入；空 = 執行時自動偵測
+    profile: str = ""  # livesub-setup 選定的等級；空 = 執行時自動偵測
+    profile_override: str = ""  # 使用者手動指定（優先於 profile）
     translator: str = "ct2"
     ollama_model: str = "gemma3:4b"
     ollama_url: str = "http://127.0.0.1:11434"

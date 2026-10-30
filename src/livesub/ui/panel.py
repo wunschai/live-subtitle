@@ -327,6 +327,11 @@ class ControlPanel(QWidget):
         with QSignalBlocker(self.level_bar):
             self.level_bar.setValue(round(max(0.0, min(1.0, level)) * 100))
 
+    def set_can_hide(self, can_hide: bool) -> None:
+        self.can_hide = can_hide
+        self.hide_button.setEnabled(can_hide)
+        self.hide_button.setToolTip("" if can_hide else "系統匣與熱鍵都不可用，無法隱藏")
+
     def set_hotkey_ok(self, ok: bool) -> None:
         self.hotkey_label.setText(
             "Ctrl+Alt+H 顯示/隱藏面板 · Ctrl+Alt+S 開始/停止"

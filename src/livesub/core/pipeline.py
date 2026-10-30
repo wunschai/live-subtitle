@@ -378,14 +378,18 @@ class Pipeline:
 
     def _run_asr(self, req: _Req) -> AsrResult:
         src = self.settings.audio.source_language
-        language = None if src == "auto" else src
-        if req.kind == "partial" and language is None:
-            language = self._utt_lang.get(req.utt_id)
+        if src != "auto":
+            language = hint = src
+        else:
+            # 自動模式：語言只信「這一句」不帶 prompt 的 partial 偵測結果。
+            # 不知道語言時完全不給 prompt——中文提示會把英文句子帶偏（漏字、出現全形字元）。
+            hint = self._utt_lang.get(req.utt_id)
+            language = hint if req.kind == "partial" else None
         now = self._clock()
         if now - self._last_final_t > CONTEXT_RESET_S:
             self._prompt_ctx, self._prompt_lang = "", None
-        static = ZH_PROMPT if src == "zh" or (src == "auto" and self._prompt_lang == "zh") else ""
-        ctx = self._prompt_ctx if language is None or language == self._prompt_lang else ""
+        static = ZH_PROMPT if hint == "zh" else ""
+        ctx = self._prompt_ctx if hint is not None and hint == self._prompt_lang else ""
         budget = PROMPT_MAX_CHARS - len(static) - 1
         ctx = ctx[-budget:] if budget > 0 else ""  # 固定提示保留，上下文從尾端截
         prompt = " ".join(x for x in (static, ctx) if x) or None
@@ -492,6 +496,8 @@ class Pipeline:
             return
         silence = 0.0 if ev.forced else SegmenterConfig().end_silence_s
         self._latencies.append(self._clock() - ev.emitted_at + silence)
+        log.info("final #%d [%s%s] %.2fs asr=%.2fs：%s", ev.utt_id, lang, "/切段" if ev.forced else "",
+                 self._latencies[-1], r.seconds, text)
         self._remember_context(text, lang)
         self._queue_translation(session, line.id, text, lang)
 

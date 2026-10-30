@@ -88,6 +88,34 @@ def downgrade(p: Profile) -> Profile | None:
     return PROFILES[p.fallback] if p.fallback else None
 
 
+def probe_openvino_gpu() -> bool | None:
+    """OpenVINO 是否看得到 GPU。沒裝 OpenVINO 回傳 None。"""
+    try:
+        import openvino as ov
+    except Exception:
+        return None
+    try:
+        return any(d.startswith("GPU") for d in ov.Core().available_devices)
+    except Exception:
+        return False
+
+
+def resolve(runtime, cli_profile: str | None = None) -> Profile:
+    """決定這次執行用哪個等級：命令列 > 手動指定 > setup 結果 > 現場偵測。"""
+    import os
+
+    from . import hardware
+
+    name = cli_profile or runtime.profile_override or runtime.profile
+    if name:
+        logical = os.cpu_count() or 4
+        hw = hardware.HardwareInfo(os="", arch="", cpu_name="", physical_cores=max(1, logical // 2),
+                                   logical_cores=logical, ram_gb=0)
+        return with_threads(get(name), hw)
+    hw = hardware.detect()
+    return select_profile(hw, probe_openvino_gpu() if hw.intel_gpu else None)
+
+
 def get(name: str) -> Profile:
     if name not in PROFILES:
         raise KeyError(f"未知的等級：{name}（可用：{', '.join(PROFILES)}）")
