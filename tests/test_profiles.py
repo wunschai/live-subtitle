@@ -26,7 +26,8 @@ INTEL = hw.GPUInfo("intel", "Intel(R) Arc(TM) Graphics", 0)
     (_info([INTEL, NV(12288)]), None, "nvidia-high"),
     (_info([INTEL], ram=32), None, "intel-gpu"),
     (_info([INTEL], ram=32), True, "intel-gpu"),
-    (_info([INTEL], ram=8), None, "intel-gpu-lite"),
+    (_info([INTEL], ram=8), None, "intel-gpu"),
+    (_info([INTEL], ram=4), None, "intel-gpu-lite"),
     (_info([INTEL], ram=32), False, "cpu-high"),
     (_info([INTEL], ram=32, arch="arm64"), None, "cpu-high"),
     (_info([hw.GPUInfo("amd", "Radeon", 0)], cores=8, ram=16), None, "cpu-high"),
@@ -59,6 +60,10 @@ def test_all_profile_models_registered():
         assert p.asr_model in models.REGISTRY
         kind = models.REGISTRY[p.asr_model].kind
         assert kind == ("asr-openvino" if p.asr_backend == "openvino" else "asr-ct2")
+        if p.partial_model:  # 獨立 partial 引擎用同一個後端、同一個裝置
+            assert p.partial_model in models.REGISTRY
+            assert models.REGISTRY[p.partial_model].kind == kind
+            assert p.partial_interval_s > 0
 
 
 def test_get_unknown():

@@ -31,6 +31,7 @@ class PipelineStatus:
     asr_model: str = ""
     latency_s: float | None = None  # 最近一句 final 的延遲（句尾 → 出字）
     mt_latency_s: float | None = None  # 原文出現 → 譯文出現（中位數）
+    partial_latency_s: float | None = None  # 邊講邊出字：音訊送出 → 畫面出字（中位數）
     level: float = 0.0  # 0–1 麥克風音量
     overflows: int = 0  # 音訊緩衝溢位（掉音）次數
     segmented: bool = False  # True = 分段字幕模式（CPU，沒有或很少 partial）

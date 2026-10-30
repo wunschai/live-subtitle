@@ -75,18 +75,27 @@ def _joiner(lang: str, prev: str = "") -> str:
 
 
 class CaptionBoard:
-    """保留最近幾句 final，加上目前的一句 partial。"""
+    """保留最近幾句 final，加上還沒定稿的 partial。
+
+    partial 引擎與 final 引擎並行時，下一句的 partial 可能比上一句的 final 先到，
+    所以每個未定稿的段落各保留一份 partial，依段落順序顯示。
+    """
 
     def __init__(self, keep_lines: int = 6, clock=time.monotonic):
         self.keep_lines = keep_lines
         self._clock = clock
         self.lines: list[CaptionLine] = []
-        self.partial: _Partial | None = None
+        self.partials: dict[int, _Partial] = {}  # utt_id → 該段最新的 partial
         self._next_id = 1
         self._finalized_utts: set[int] = set()
         self._max_final_utt = 0
         self.last_activity = clock()
         self.revision = 0
+
+    @property
+    def partial(self) -> _Partial | None:
+        """最新一段的 partial（沒有就是 None）。"""
+        return self.partials[max(self.partials)] if self.partials else None
 
     # ---- 修改 ---------------------------------------------------------
     def _touch(self) -> None:
@@ -100,7 +109,7 @@ class CaptionBoard:
         text = text.strip()
         if not text:
             return False
-        self.partial = _Partial(utt_id, text, lang)
+        self.partials[utt_id] = _Partial(utt_id, text, lang)
         self._touch()
         return True
 
@@ -109,15 +118,14 @@ class CaptionBoard:
 
         只記錄這一段，不推進 _max_final_utt——較舊的段落可能還在辨識中，不能被連帶封鎖。
         """
-        if self.partial and self.partial.utt_id == utt_id:
-            self.partial = None
+        if self.partials.pop(utt_id, None) is not None:
             self._touch()
         self._finalized_utts.add(utt_id)
 
     def add_final(self, utt_id: int, raw: str, text: str, lang: str) -> CaptionLine | None:
         """加入一句確認的字幕；text 為空表示這段被丟棄（只清掉 partial）。"""
-        if self.partial and self.partial.utt_id <= utt_id:
-            self.partial = None
+        for u in [u for u in self.partials if u <= utt_id]:
+            del self.partials[u]
         self._finalized_utts.add(utt_id)
         self._max_final_utt = max(self._max_final_utt, utt_id)
         if len(self._finalized_utts) > 256:  # 比 _max_final_utt 舊的已由比較式擋下，不必再記
@@ -156,7 +164,7 @@ class CaptionBoard:
 
     def clear(self) -> None:
         self.lines.clear()
-        self.partial = None
+        self.partials.clear()
         self._touch()
 
     # ---- 顯示 ---------------------------------------------------------
@@ -168,7 +176,7 @@ class CaptionBoard:
         else:
             blocks = (self._block("orig", single=True),)
         idle = self._clock() - self.last_activity
-        visible = not (clear_after_s > 0 and idle >= clear_after_s and self.partial is None)
+        visible = not (clear_after_s > 0 and idle >= clear_after_s and not self.partials)
         return BoardSnapshot(blocks=blocks, visible=visible, revision=self.revision)
 
     @staticmethod
@@ -193,10 +201,11 @@ class CaptionBoard:
 
         for line in self.lines:
             add(self._line_span(line, target, single), line.lang if target == "orig" else target)
-        p = self.partial
         # 單語模式：任何語言的 partial 都先淡色顯示；雙語模式：只出現在自己語言那一行
-        if p is not None and (single or target == p.lang):
-            add(Span(p.text, dim=True), p.lang)
+        for u in sorted(self.partials):
+            p = self.partials[u]
+            if single or target == p.lang:
+                add(Span(p.text, dim=True), p.lang)
         return Block(target, tuple(spans))
 
 

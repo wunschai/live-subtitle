@@ -19,12 +19,16 @@ import numpy as np
 from . import config, hardware, models, paths, profiles
 from .profiles import Profile
 
-# 5 秒音訊的解碼時間上限（秒）：AC-LAT 目標扣掉句尾靜音 0.6 s 與翻譯餘裕
+# 5 秒音訊的定稿解碼時間上限（秒）。有獨立 partial 引擎的等級，量的是「partial 同時在跑」時的時間。
+# 鏈上最後一個 GPU 等級放寬：再降下去是 CPU，只會更慢。
 DECODE_BUDGET = {
     "nvidia-high": 0.8, "nvidia-mid": 0.8, "nvidia-low": 0.8,
-    "intel-gpu": 1.9, "intel-gpu-lite": 1.4,
+    "intel-gpu": 1.2, "intel-gpu-lite": 1.4,
     "cpu-high": 3.4, "cpu-low": 3.4,
 }
+PARTIAL_BUDGET = 0.6  # 獨立 partial 引擎在定稿同時進行時，單次推論的中位數上限（秒）
+PARTIAL_JOIN_S = 10.0  # 校正結束後等 partial 推論收尾的上限；超過就判定這一級不可用
+MIN_MATCHED_CHARS = 6  # 5 秒測試音至少要辨識出這麼多個對得上的字（擋住只輸出「的」之類的異常）
 SAFETY_MODEL = "whisper-base"  # CPU 保底：一律下載，離線時也能退回
 BENCH_TEXT = "大家好，歡迎參加今天的工作坊。我們今天要介紹圖書館的數位資源，以及如何查詢期刊論文。"
 
@@ -66,14 +70,23 @@ def bench_audio() -> tuple[np.ndarray, str | None]:
 
 def ensure_models(p: Profile) -> None:
     for key in dict.fromkeys([p.asr_model, SAFETY_MODEL, "mt-zh-en", "mt-en-zh"]):
-        if models.is_downloaded(key):
-            bad = models.verify(key)
-            if not bad:
-                continue
-            say(f"{key} 檔案損毀（{', '.join(bad)}），重新下載")
-            models.download(key, progress=say, force=True)
-        else:
-            models.download(key, progress=say)
+        _ensure(key)
+    if p.partial_model:
+        try:  # 即時模型下載失敗不中止安裝：校正時會判定這一級不可用並降級
+            _ensure(p.partial_model)
+        except Exception as e:
+            say(f"即時辨識模型 {p.partial_model} 下載失敗：{e}")
+
+
+def _ensure(key: str) -> None:
+    if models.is_downloaded(key):
+        bad = models.verify(key)
+        if not bad:
+            return
+        say(f"{key} 檔案損毀（{', '.join(bad)}），重新下載")
+        models.download(key, progress=say, force=True)
+    else:
+        models.download(key, progress=say)
 
 
 MIN_SIMILARITY = 0.5
@@ -92,8 +105,39 @@ def cuda_ready() -> bool:
         return False
 
 
+def _similarity(text: str, expected: str | None) -> float | None:
+    """輸出中有多少比例的字對得上預期文字（忽略標點與空白）。
+
+    測試音只取前 5 秒，句子會被截斷，所以不跟整句比，只看「說出來的字對不對」；
+    目的是抓 GPU 編譯器出錯時的亂碼輸出。
+    """
+    if not expected:
+        return None
+    import re
+    from difflib import SequenceMatcher
+
+    from .core.textproc import to_traditional
+
+    def norm(s: str) -> str:
+        return re.sub(r"[\W_]+", "", s)
+
+    got, want = norm(to_traditional(text)), norm(expected)
+    if not got:
+        return 0.0
+    matched = sum(b.size for b in SequenceMatcher(None, got, want, autojunk=False).get_matching_blocks())
+    if matched < MIN_MATCHED_CHARS:  # 輸出太少：就算每個字都對，也代表大量漏字
+        return 0.0
+    return round(matched / len(got), 2)
+
+
 def probe(p: Profile, audio: np.ndarray, expected: str | None) -> dict:
-    """實際載入並推論。回傳結果字典（ok / 秒數 / 文字 / 錯誤）。"""
+    """實際載入並推論。回傳結果字典（ok / 秒數 / 文字 / 錯誤）。
+
+    有獨立 partial 引擎的等級：兩個引擎都載入、都檢查輸出，並在 partial 連續推論的同時量定稿時間，
+    與執行期的負載一致（兩者會搶同一張顯示卡）。
+    """
+    import threading
+
     from .core.asr import build_asr
 
     t0 = time.perf_counter()
@@ -101,17 +145,58 @@ def probe(p: Profile, audio: np.ndarray, expected: str | None) -> dict:
         eng = build_asr(p)
         load_s = time.perf_counter() - t0
         eng.transcribe(audio[:16000], language="zh", final=False)  # 暖機（OpenVINO 會編譯並快取）
-        runs = [eng.transcribe(audio, language="zh", final=True) for _ in range(2)]
     except Exception as e:  # 驅動、DLL、記憶體不足…
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    decode = min(r.seconds for r in runs)
-    res = {"ok": True, "load_s": round(load_s, 2), "decode_5s": round(decode, 2), "text": runs[-1].text}
-    if expected:
-        from difflib import SequenceMatcher
+    peng = None
+    res: dict = {"ok": True, "load_s": round(load_s, 2)}
+    if p.partial_model:
+        try:
+            if not models.is_downloaded(p.partial_model):
+                raise RuntimeError("模型未下載")
+            peng = build_asr(replace(p, asr_model=p.partial_model))
+            ptext = peng.transcribe(audio, language="zh", final=False).text  # 暖機兼檢查輸出
+        except Exception as e:
+            return {"ok": False, "error": f"即時辨識模型 {p.partial_model}：{type(e).__name__}: {e}"}
+        res["partial_text"] = ptext
+        res["partial_similarity"] = _similarity(ptext, expected)
 
-        from .core.textproc import to_traditional
+    partial_times: list[float] = []
+    partial_errors: list[BaseException] = []
+    started, done = threading.Event(), threading.Event()
 
-        res["similarity"] = round(SequenceMatcher(None, to_traditional(runs[-1].text), expected).ratio(), 2)
+    def keep_partial_busy():
+        try:
+            while not done.is_set():
+                started.set()
+                partial_times.append(peng.transcribe(audio[:16000 * 2], language="zh", final=False).seconds)
+        except BaseException as e:  # 背景執行緒的例外不會自己傳回主執行緒
+            partial_errors.append(e)
+        finally:
+            started.set()
+
+    th = threading.Thread(target=keep_partial_busy, daemon=True) if peng is not None else None
+    try:
+        if th:
+            th.start()
+            started.wait(10)  # 確定 partial 已經在推論，定稿才開始量
+        runs = [eng.transcribe(audio, language="zh", final=True) for _ in range(2)]
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        done.set()
+        if th:
+            th.join(timeout=PARTIAL_JOIN_S)
+    if th is not None:
+        if th.is_alive():
+            return {"ok": False, "error": f"即時辨識模型 {p.partial_model}：推論超過 {PARTIAL_JOIN_S:.0f} 秒沒有回應"}
+        if partial_errors:
+            e = partial_errors[0]
+            return {"ok": False, "error": f"即時辨識模型 {p.partial_model}（並行時）：{type(e).__name__}: {e}"}
+        if not partial_times:
+            return {"ok": False, "error": f"即時辨識模型 {p.partial_model}：沒有量到任何推論"}
+        res["partial_s"] = round(float(np.median(partial_times)), 2)
+    res.update(decode_5s=round(min(r.seconds for r in runs), 2), text=runs[-1].text,
+               similarity=_similarity(runs[-1].text, expected))
     return res
 
 
@@ -153,11 +238,16 @@ def choose(hw: hardware.HardwareInfo, forced: str | None, skip_bench: bool) -> t
             say(f"  失敗：{r['error']}")
         else:
             say(f"  5 秒音訊解碼 {r['decode_5s']} 秒（上限 {DECODE_BUDGET[p.name]}），輸出：{r['text'][:40]}")
-            sim = r.get("similarity")
+            if "partial_s" in r:
+                say(f"  即時辨識 {r['partial_s']} 秒／次（上限 {PARTIAL_BUDGET}），輸出：{r['partial_text'][:40]}")
+            sim, psim = r.get("similarity"), r.get("partial_similarity")
             if (sim is not None and sim < MIN_SIMILARITY) or not r["text"].strip():
                 # 能跑但辨識結果是空的或亂碼（例如 GPU 編譯器出錯）：不能採用
                 say(f"  辨識結果不正確（相似度 {sim}），降一級")
-            elif skip_bench or forced or r["decode_5s"] <= DECODE_BUDGET[p.name]:
+            elif p.partial_model and ((psim is not None and psim < MIN_SIMILARITY) or not r["partial_text"].strip()):
+                say(f"  即時辨識結果不正確（相似度 {psim}），降一級")
+            elif skip_bench or forced or (r["decode_5s"] <= DECODE_BUDGET[p.name]
+                                          and r.get("partial_s", 0) <= PARTIAL_BUDGET):
                 return p, log
             else:
                 say("  太慢，降一級")

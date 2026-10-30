@@ -155,3 +155,26 @@ def test_unpunctuated_chinese_lines_get_separator():
     b.add_final(2, "r", "今天介紹資料庫。", "zh")
     b.add_final(3, "r", "第三句", "zh")
     assert b.snapshot("zh").blocks[0].text == "大家好　今天介紹資料庫。第三句"
+
+
+def test_next_partial_arriving_before_previous_final_keeps_both():
+    """獨立 partial 引擎：下一句的 partial 可能比上一句的 final 先到，上一句的預覽不能消失。"""
+    b = CaptionBoard()
+    assert b.set_partial(1, "第一句還在定稿", "zh")
+    assert b.set_partial(2, "第二句開始了", "zh")
+    assert texts(b.snapshot("original")) == ["第一句還在定稿　第二句開始了"]
+    b.add_final(1, "raw", "第一句定稿。", "zh")
+    snap = b.snapshot("original")
+    assert texts(snap) == ["第一句定稿。第二句開始了"]
+    assert [sp.dim for sp in snap.blocks[0].spans if sp.text] == [False, True]
+    assert b.partial.utt_id == 2
+    b.cancel_partial(2)
+    assert b.partial is None and texts(b.snapshot("original")) == ["第一句定稿。"]
+
+
+def test_final_clears_all_older_partials_only():
+    b = CaptionBoard()
+    for u in (1, 2, 3):
+        b.set_partial(u, f"p{u}", "en")
+    b.add_final(2, "raw", "Final two.", "en")
+    assert sorted(b.partials) == [3]

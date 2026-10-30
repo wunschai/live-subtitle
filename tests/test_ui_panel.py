@@ -101,7 +101,7 @@ def test_status_never_emits_settings(panel):
     assert emissions == []
     assert STATE_LABELS[status.state] in panel.status_label.text()
     assert "CPU 基本" in panel.status_label.text()
-    assert "延遲 1.2 秒" in panel.status_label.text()
+    assert "定稿 1.2 秒" in panel.status_label.text()
     assert "分段字幕" in panel.status_label.text()
     assert panel.warning_label.text() == "已切換備援模型"
     assert not panel.warning_label.isHidden()
@@ -224,4 +224,11 @@ def test_status_shows_translation_latency_and_overflows(panel):
     panel.set_status(PipelineStatus(state=PipelineState.RUNNING, profile_label="Intel 內顯",
                                     latency_s=2.0, mt_latency_s=0.12, overflows=3))
     text = panel.status_label.text() + panel.warning_label.text()
-    assert "延遲 2.0 秒" in text and "譯 +0.1 秒" in text and "掉音 3" in text
+    assert "定稿 2.0 秒" in text and "譯 +0.1 秒" in text and "掉音 3" in text
+
+
+def test_status_shows_live_partial_latency(panel):
+    panel.set_status(PipelineStatus(state=PipelineState.RUNNING, partial_latency_s=0.34, latency_s=0.9))
+    text = panel.status_label.text()
+    assert "即時 0.3 秒" in text and "定稿 0.9 秒" in text
+    assert text.index("即時") < text.index("定稿")

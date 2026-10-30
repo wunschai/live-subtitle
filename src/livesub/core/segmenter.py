@@ -22,14 +22,14 @@ class SegmenterConfig:
     end_threshold: float = 0.35  # 遲滯：低於這個才算靜音
     start_frames: int = 3  # 連續幾幀才算開始說話（約 96 ms）
     preroll_s: float = 0.4
-    end_silence_s: float = 0.6
+    end_silence_s: float = 0.5
     tail_pad_s: float = 0.2  # final 音訊保留的句尾靜音
     min_speech_s: float = 0.2
     max_segment_s: float = 8.0
     cut_search_s: float = 2.0
     cut_min_gap_frames: int = 3  # 強制切段時優先找的低語音區間長度
     partial_interval_s: float = 0.0  # 0 = 不出 partial
-    partial_min_s: float = 0.6
+    partial_min_s: float = 0.4
 
 
 @dataclass

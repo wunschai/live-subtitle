@@ -49,14 +49,14 @@ mic ─▶ AudioSource ─▶ VAD(Silero onnx, 32ms) ─▶ Segmenter ─┬─ 
 |---|---|
 | audio callback | 由 sounddevice 呼叫，只負責把資料放進 queue |
 | pipeline | VAD 加上 segmenter |
-| ASR worker | 單一執行緒；final 永遠優先於 partial，佇列裡過時的 partial 直接丟棄 |
+| ASR worker | 共用引擎時是單一執行緒，每次推論前先取 final，沒有才取最新的 partial。等級有 `partial_model` 時拆成 final 與 partial 兩條執行緒，各用自己的引擎並行（見下方「邊講邊出字」） |
 | translate worker | 單一執行緒，按順序處理 |
 | Qt 主執行緒 | 畫面 |
 
 ### 斷句策略（Segmenter，數值都可以在 profile 調整）
 
 - **語音開始**：VAD 機率 ≥ 0.5，且連續 ≥ 3 幀（約 96 ms）。保留 400 ms pre-roll。
-- **句尾**：靜音 ≥ 600 ms 時送出 FinalRequest（整段音訊）。
+- **句尾**：靜音 ≥ 500 ms 時送出 FinalRequest（整段音訊）。
 - **強制切段**：一段語音累積到 `max_segment_s`（預設 8 s）時，在最後 1.5 s 內 VAD 機率最低的位置切開送 final，剩下的音訊延續到下一段。
 - **太短不送**：語音不到 0.35 s 直接丟棄，避免咳嗽或雜音觸發幻覺。
 - **partial**：說話中每隔 `partial_interval_s` 送一次目前累積的音訊，這個值依等級設定，0 代表關閉。ASR worker 忙碌時，partial 自動被覆蓋，不會堆積。
@@ -138,15 +138,31 @@ mic ─▶ AudioSource ─▶ VAD(Silero onnx, 32ms) ─▶ Segmenter ─┬─ 
 
 | 等級 | 條件 | ASR | final beam | partial | 翻譯 |
 |---|---|---|---|---|---|
-| `nvidia-high` | NVIDIA VRAM ≥ 8 GB | Breeze-ASR-25 CT2 fp16（cuda float16） | 5 | 0.6 s | quickmt cuda |
-| `nvidia-mid` | NVIDIA 4–8 GB | large-v3-turbo（cuda int8_float16） | 3 | 0.8 s | quickmt cuda |
-| `nvidia-low` | NVIDIA < 4 GB | small（cuda int8_float16） | 3 | 0.8 s | quickmt cpu |
-| `intel-gpu` | Intel Arc/Iris Xe 內顯，且 OpenVINO 看得到 GPU；RAM ≥ 16 GB | OpenVINO large-v3-turbo-int8（GPU） | – | 1.5 s | quickmt cpu |
-| `intel-gpu-lite` | 同上，但 RAM < 16 GB | OpenVINO small-int8（GPU） | – | 1.0 s | quickmt cpu |
+| `nvidia-high` | NVIDIA VRAM ≥ 8 GB | Breeze-ASR-25 CT2 fp16（cuda float16） | 5 | 0.3 s（共用） | quickmt cuda |
+| `nvidia-mid` | NVIDIA 4–8 GB | large-v3-turbo（cuda int8_float16） | 3 | 0.3 s（共用） | quickmt cuda |
+| `nvidia-low` | NVIDIA < 4 GB | small（cuda int8_float16） | 3 | 0.3 s（共用） | quickmt cpu |
+| `intel-gpu` | Intel Arc/Iris Xe 內顯，且 OpenVINO 看得到 GPU；RAM ≥ 8 GB | OpenVINO small-int8（GPU） | – | 0.2 s，獨立引擎 base-int8 | quickmt cpu |
+| `intel-gpu-lite` | 同上，但 RAM < 8 GB，或 intel-gpu 校正太慢 | OpenVINO base-int8（GPU） | – | 0.3 s（共用） | quickmt cpu |
 | `cpu-high` | 沒有可用 GPU，實體核心 ≥ 6 且 RAM ≥ 8 GB | small int8 | 1 | 關 | quickmt cpu |
 | `cpu-low` | 其他 | base int8 | 1 | 2.0 s | quickmt cpu |
 
-- **自我校正**：安裝程式用內建 TTS 測試音（或隨附的 `assets/bench_zh.wav`）跑一次解碼。若 5 秒音訊的解碼時間超過 2.5 s，自動降一級，並記錄到 config。
+- **自我校正**：安裝程式用內建 TTS 測試音（或隨附的 `assets/bench_zh.wav`）跑一次解碼。5 秒音訊的定稿解碼時間超過該等級的 `DECODE_BUDGET`，或辨識結果相似度太低，就自動降一級，並記錄到 config。有獨立 partial 引擎的等級，兩個引擎都要通過輸出檢查，而且定稿時間是在 partial 同時推論的情況下量的；partial 單次推論的中位數也不得超過 `PARTIAL_BUDGET`（0.6 s）。
+
+### 邊講邊出字（2026-10-30 追加）
+
+使用者要求說話中就出字，延遲 0.5–1 秒。實測結果（Intel Arc 內顯）：
+
+- Whisper 一律補滿 30 秒再編碼，單次推論時間與音訊長度無關：turbo 1.3 s、small 0.45 s、base 0.23 s。縮短編碼窗口（`chunk_length`）沒有效果。
+- turbo 定稿時，同時跑的 partial 會被卡到 3 s。兩個 small 並行，各約 0.7–0.9 s。
+- 評估過的其他方案：Moonshine 中文串流模型（MIT，美國）在這台 CPU 上跟不上即時，同音錯字也多；Voxtral Realtime（Mistral，法國，Apache-2.0）延遲最低，但需要 16 GB 以上的 NVIDIA 顯示卡。
+
+**決策**：
+
+1. Profile 新增 `partial_model`。有值時另建一個引擎與執行緒專跑 partial，與 final 並行；沒有就共用引擎，由單一 worker 排程，final 優先。
+2. 內顯改為 small 定稿加 base 即時。
+3. `CaptionBoard` 每個未定稿的段落各保留一份 partial，因為並行時下一句的 partial 可能比上一句的 final 先到。
+4. 語言提示只採用音訊 ≥ 1.4 s 的 partial 判斷。已定稿的段落，晚到的 partial 不得再寫入語言快取。
+5. 獨立 partial 引擎連續失敗 3 次就停用即時辨識，定稿照常，並在面板提示。
 - **手動指定**：可用 `--profile` 強制指定等級，也可以之後在 config 裡改。
 
 ### 安裝流程

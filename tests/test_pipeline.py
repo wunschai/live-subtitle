@@ -541,6 +541,211 @@ def test_partial_failures_do_not_block_segment_or_fail_pipeline():
     p.start()
     assert wait_for(lambda: asr.n >= 4, timeout=25)
     assert p.state == PipelineState.RUNNING  # partial 一再失敗也不會讓整個工作失敗
-    assert p.stats["asr_errors"] > 0 and p.stats["partials"] > 0
+    assert p.stats["partial_errors"] > 0 and p.stats["partials"] > 0 and p.stats["asr_errors"] == 0
     assert p.board.lines and all("第" in l.original for l in p.board.lines)
+    p.stop(wait=True)
+
+
+
+# ---- 邊講邊出字（獨立 partial 引擎）的回歸測試 ------------------------------
+class TrackingASR(FakeASR):
+    """記錄同時進行的推論數，以及 partial 開始時 final 佇列的狀態。"""
+
+    def __init__(self, delay=0.0, partial_delay=0.0, name="fake-asr"):
+        super().__init__(delay, partial_delay)
+        self.name = name
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+        self.pipeline = None
+        self.partial_starts_with_final_waiting = 0
+        self.spans = []  # (kind, start, end)
+
+    def transcribe(self, audio, language=None, prompt=None, final=True):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if not final and self.pipeline is not None and self.pipeline._cur is not None \
+                    and self.pipeline._cur.final_q:
+                self.partial_starts_with_final_waiting += 1
+        t0 = time.monotonic()
+        try:
+            return super().transcribe(audio, language, prompt, final)
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.spans.append(("final" if final else "partial", t0, time.monotonic()))
+
+
+BURSTS = [(0.3, False)] + [(1.6, True), (0.6, False)] * 5
+
+
+def _streaming(profile, final_eng, partial_eng=None, source_pattern=BURSTS):
+    s = Settings()
+    s.display.clear_after_s = 0
+    rec = Recorder()
+
+    def factory(prof):
+        if partial_eng is not None and prof.asr_model == profiles.get(profile).partial_model:
+            return partial_eng
+        return final_eng
+
+    p = Pipeline(s, profiles.get(profile), rec.snap, rec.status,
+                 source_factory=lambda _s: FakeSource(source_pattern, 1.0), asr_factory=factory,
+                 mt_factory=lambda _p, _s: FakeMT(), vad_factory=FakeVAD, require_models=False)
+    final_eng.pipeline = p
+    if partial_eng is not None:
+        partial_eng.pipeline = p
+    return p, rec
+
+
+def test_shared_engine_never_overlaps_and_final_goes_first():
+    """共用引擎：同一時間只有一個推論；final 已排隊時不會先跑 partial。"""
+    eng = TrackingASR(delay=0.9, partial_delay=0.15)
+    p, rec = _streaming("nvidia-mid", eng)
+    p.start()
+    assert wait_for(lambda: eng.n >= 5, timeout=30)
+    assert eng.max_active == 1
+    assert eng.partial_starts_with_final_waiting == 0
+    assert p.stats["partials"] > 0
+    names = {t.name for t in p._cur.threads}
+    assert "livesub-asr" in names and "livesub-asr-partial" not in names
+    p.stop(wait=True)
+
+
+def test_separate_partial_engine_runs_in_parallel_with_final():
+    final_eng = TrackingASR(delay=1.2, name="final")
+    partial_eng = TrackingASR(partial_delay=0.1, name="partial")
+    p, rec = _streaming("intel-gpu", final_eng, partial_eng)
+    p.start()
+    assert wait_for(lambda: final_eng.n >= 4, timeout=30)
+    p.stop(wait=True)
+    assert p._cur.asr_partial is partial_eng
+    # 各自只跑自己的工作（暖機是 1 秒靜音的 partial 呼叫，排除）
+    assert all(k == "partial" for k, *_ in partial_eng.spans)
+    assert [k for k, *_ in final_eng.spans if k == "partial"] == ["partial"]  # 只有暖機
+    finals = [(a, b) for k, a, b in final_eng.spans if k == "final"]
+    overlapped = sum(1 for _, a, b in partial_eng.spans if any(fa < a < fb for fa, fb in finals))
+    assert overlapped > 0  # final 推論期間 partial 照樣在跑
+    assert p.stats["partials"] > 0
+    st = rec.statuses[-1]
+    assert any(x.partial_latency_s is not None for x in rec.statuses)
+
+
+def test_partial_engine_init_failure_falls_back_to_shared_with_message():
+    final_eng = TrackingASR()
+
+    def factory(prof):
+        if prof.asr_model == profiles.get("intel-gpu").partial_model:
+            raise RuntimeError("GPU 編譯失敗")
+        return final_eng
+
+    s = Settings()
+    rec = Recorder()
+    p = Pipeline(s, profiles.get("intel-gpu"), rec.snap, rec.status,
+                 source_factory=lambda _s: FakeSource(BURSTS, 1.0), asr_factory=factory,
+                 mt_factory=lambda _p, _s: FakeMT(), vad_factory=FakeVAD, require_models=False)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    assert p.active_profile.name == "intel-gpu"
+    assert p._cur.asr_partial is None
+    assert "即時辨識模型無法使用" in rec.statuses[-1].message
+    assert "livesub-asr" in {t.name for t in p._cur.threads}
+    p.stop(wait=True)
+
+
+def test_broken_partial_engine_is_disabled_but_finals_continue():
+    class DeadPartial(TrackingASR):
+        def transcribe(self, audio, language=None, prompt=None, final=True):
+            if len(audio) == SR:  # 暖機可以過
+                return AsrResult("", "zh", None, None, 0.0)
+            raise RuntimeError("device lost")
+
+    final_eng = TrackingASR(name="final")
+    partial_eng = DeadPartial(name="partial")
+    p, rec = _streaming("intel-gpu", final_eng, partial_eng)
+    p.start()
+    assert wait_for(lambda: final_eng.n >= 4, timeout=30)
+    assert p.state == PipelineState.RUNNING
+    assert p._cur.partials_off
+    assert p.stats["partial_errors"] == 3  # 停用後就不再送 partial
+    assert any("即時辨識引擎故障" in st.message for st in rec.statuses)
+    assert p.board.lines
+    p.stop(wait=True)
+
+
+def _bare_session(p):
+    from livesub.core.pipeline import _Req, _Session
+
+    s = _Session(1, time.monotonic)
+    s.asr = FakeASR()
+    return s, _Req
+
+
+def test_short_partial_does_not_lock_sentence_language():
+    p, *_ = make(SPEECH)
+    s, Req = _bare_session(p)
+    p._run_asr(s, Req("partial", 1, np.zeros(int(SR * 0.7), np.float32), 1.0, 0.0))
+    assert 1 not in s.utt_lang  # 太短：不採用語言判斷
+    p._run_asr(s, Req("partial", 1, np.zeros(int(SR * 1.5), np.float32), 1.0, 0.0))
+    assert s.utt_lang[1] == "zh"
+
+
+def test_late_partial_after_final_does_not_revive_language_cache():
+    p, *_ = make(SPEECH)
+    s, Req = _bare_session(p)
+    p._run_asr(s, Req("final", 1, np.zeros(SR * 2, np.float32), 1.0, 0.0))
+    p._run_asr(s, Req("partial", 1, np.zeros(SR * 2, np.float32), 1.0, 0.0))  # 晚到
+    assert 1 not in s.utt_lang
+
+
+def test_missing_models_note_tells_user_to_reinstall(monkeypatch):
+    import livesub.core.pipeline as P
+
+    monkeypatch.setattr(P.models, "is_downloaded", lambda key: key == "whisper-base")
+    s = Settings()
+    rec = Recorder()
+    p = Pipeline(s, profiles.get("intel-gpu"), rec.snap, rec.status,
+                 source_factory=lambda _s: FakeSource(SPEECH), asr_factory=lambda _p: FakeASR(),
+                 mt_factory=lambda _p, _s: FakeMT(), vad_factory=FakeVAD, require_models=True)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    assert p.active_profile.name == "cpu-low"
+    assert "重新執行安裝程式" in rec.statuses[-1].message
+    p.stop(wait=True)
+
+
+def test_cancelled_or_failed_segments_do_not_keep_language_cache():
+    from livesub.core.segmenter import SegEvent
+
+    p, *_ = make(SPEECH)
+    s, Req = _bare_session(p)
+    long = np.zeros(int(SR * 1.5), np.float32)
+    p._run_asr(s, Req("partial", 3, long, 1.0, 0.0))
+    assert s.utt_lang[3] == "zh"
+    p._submit(s, SegEvent("cancel", 3))  # 雜音段被取消
+    assert 3 not in s.utt_lang
+    p._run_asr(s, Req("partial", 3, long, 1.0, 0.0))  # 晚到的 partial
+    assert 3 not in s.utt_lang
+
+    class Boom(FakeASR):
+        def transcribe(self, audio, language=None, prompt=None, final=True):
+            if final:
+                raise RuntimeError("boom")
+            return super().transcribe(audio, language, prompt, final)
+
+    s.asr = Boom()
+    p._run_asr(s, Req("partial", 5, long, 1.0, 0.0))
+    assert p._do_final(s, Req("final", 5, long, 1.0, 0.0))  # 失敗一次，還不到門檻
+    assert 5 not in s.utt_lang and 5 in s.ended_utts
+    assert s.max_final_utt == 0  # 沒有推進，較舊的段落仍可寫入
+
+
+def test_status_names_partial_model_when_separate():
+    final_eng = TrackingASR(name="small")
+    partial_eng = TrackingASR(name="base")
+    p, rec = _streaming("intel-gpu", final_eng, partial_eng)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    assert wait_for(lambda: rec.statuses and rec.statuses[-1].asr_model == "small＋即時 base")
     p.stop(wait=True)

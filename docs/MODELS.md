@@ -21,6 +21,7 @@
 | whisper-tiny / base / small | `Systran/faster-whisper-*` | OpenAI（美國） | openai/whisper-* | SYSTRAN（法國） | MIT |
 | whisper-large-v3-turbo | `dropbox-dash/faster-whisper-large-v3-turbo`（原 `mobiuslabsgmbh/…`，`0a363e9`） | OpenAI | openai/whisper-large-v3-turbo | Mobius Labs（德國，現屬 Dropbox） | MIT |
 | breeze-asr-25 | `phate334/Breeze-ASR-25-ct2`（`ac4ec98`） | MediaTek Research（台灣） | openai/whisper-large-v2 | phate334（GitHub 標示台灣） | Apache-2.0 |
+| ov-whisper-base | `OpenVINO/whisper-base-int8-ov`（`0606293`） | OpenAI | openai/whisper-base | Intel OpenVINO（美國） | Apache-2.0 |
 | ov-whisper-small | `OpenVINO/whisper-small-int8-ov`（`5b83171`） | OpenAI | openai/whisper-small | Intel OpenVINO（美國） | Apache-2.0 |
 | ov-whisper-large-v3-turbo | `OpenVINO/whisper-large-v3-turbo-int8-ov`（`b568445`） | OpenAI | openai/whisper-large-v3-turbo | Intel OpenVINO（美國） | Apache-2.0 |
 | mt-zh-en / mt-en-zh | `quickmt/quickmt-zh-en`（`c27cc80`）、`quickmt/quickmt-en-zh`（`f48b69e`） | quickmt（Mark Franey，加拿大） | 自行訓練 | quickmt | CC-BY-4.0 |
@@ -57,5 +58,8 @@ Ollama 的模型名稱可以在本機被 `ollama cp` 任意改掉，所以程式
 | FunASR、SenseVoice、Paraformer | Alibaba DAMO / FunAudioLLM |
 | DeepSeek、GLM / ChatGLM、Yi、InternLM / InternVL、Baichuan、MiniCPM | 中國資本或中國政府相關機構 |
 | Llama-Breeze2 | 使用 InternVL 架構與模板（上海人工智慧實驗室），有疑慮所以不採用 |
+| Moonshine 中文串流模型 | 不是來源問題（Moonshine AI，美國，MIT）：實測在一般筆電 CPU 上跟不上即時，同音錯字多 |
+| Voxtral Realtime 4B | 不是來源問題（Mistral，法國，Apache-2.0）：需要 16 GB 以上的 NVIDIA 顯示卡，留待日後評估 |
+| Confucius4-R2T2 | 網易有道（中國） |
 | NLLB-200 | 不是來源問題：授權為 CC-BY-NC（非商用），所以不採用 |
 | OPUS-MT zh↔en | 不是來源問題：實測品質與速度都不如 quickmt，所以不採用 |

@@ -6,7 +6,9 @@
 執行緒（每個工作階段各一組）：
 - loader：載入模型（逐級嘗試，必須通過實際推論才採用）、開麥克風
 - capture：讀音訊、跑 VAD 與 Segmenter，把請求交給 ASR worker
-- asr：final 優先；partial 只有一個待處理槽（新的覆蓋舊的）
+- asr：partial 只有一個待處理槽（新的覆蓋舊的），引擎一空就拿最新的音訊。兩種模式：
+  * 共用引擎：單一 worker，每次推論前先看 final 佇列（final 優先），沒有才跑最新的 partial
+  * 獨立引擎（profile.partial_model）：asr-final 與 asr-partial 兩條 worker，各用自己的引擎並行
 - mt：有上限的翻譯佇列，滿了丟最舊的
 - coordinator：唯一擁有 CaptionBoard 的執行緒；其他執行緒只送事件進來
 UI 透過 on_snapshot / on_status callback 收到不可變的快照（在背景執行緒呼叫，UI 端需轉回主執行緒）。
@@ -44,6 +46,8 @@ FINAL_QUEUE_MAX = 4
 TRANSLATE_QUEUE_MAX = 6
 MAX_MERGED_S = 20.0
 MAX_ASR_ERRORS = 3  # 連續推論失敗幾次就判定這次工作失敗
+MAX_PARTIAL_ERRORS = 3  # 獨立 partial 引擎連續失敗幾次就停用即時辨識（final 照常）
+LANG_HINT_MIN_S = 1.4  # partial 音訊至少這麼長（含 0.4 秒 preroll）才採用它的語言判斷
 JOIN_TIMEOUT_S = 15.0
 
 
@@ -84,7 +88,7 @@ class _Req:
 
 def _new_stats() -> dict:
     return {"finals": 0, "partials": 0, "dropped_partials": 0, "merged_finals": 0, "mt_skipped": 0,
-            "filtered": 0, "asr_errors": 0}
+            "filtered": 0, "asr_errors": 0, "partial_errors": 0}
 
 
 class _Session:
@@ -102,14 +106,21 @@ class _Session:
         self.board = CaptionBoard(clock=clock)
         self.latencies: deque[float] = deque(maxlen=20)
         self.mt_latencies: deque[float] = deque(maxlen=20)
+        self.partial_latencies: deque[float] = deque(maxlen=20)
         self.partial_cost = 0.0  # partial 推論耗時的指數平均
         self.prompt_ctx = ""
         self.prompt_lang: str | None = None
         self.last_final_t = 0.0
         self.utt_lang: dict[int, str] = {}
+        self.ctx_lock = threading.Lock()  # utt_lang / max_final_utt 由兩條 ASR 執行緒共用
+        self.max_final_utt = 0  # 已辨識完 final 的最大段落編號（晚到的 partial 不得再寫語言快取）
+        self.ended_utts: set[int] = set()  # 取消、丟棄或 final 失敗的段落（不會有 final，也不得再寫快取）
+        self.partial_errors = 0
+        self.partials_off = False  # 獨立 partial 引擎壞掉後停用即時辨識
         self.asr_errors = 0
         self.level = 0.0
         self.asr = None
+        self.asr_partial = None  # 獨立的 partial 引擎；None = 共用 asr（單一 worker 排程）
         self.mt = None
         self.mt_on_cpu = False
         self.source: AudioSource | None = None  # loader 交付後才設定；之後由 stopper 負責關閉
@@ -279,6 +290,10 @@ class Pipeline:
                 s.source.stop()
             except Exception:
                 log.exception("關閉音訊來源失敗")
+        if s.latencies or s.partial_latencies:
+            log.info("本次統計（最近 20 句）：即時 p50=%s 秒，定稿 p50=%s 秒，譯文 p50=%s 秒，%s",
+                     *(f"{self._median(x):.2f}" if x else "-"
+                       for x in (s.partial_latencies, s.latencies, s.mt_latencies)), s.stats)
         alive = [t for t in s.alive_threads() if t is not me]
         if alive:
             log.warning("仍有 %d 個執行緒未結束：%s", len(alive), [t.name for t in alive])
@@ -303,7 +318,7 @@ class Pipeline:
         # 交付與 stop 旗標都在 self._lock 內判斷，所以來源只會由 loader 或 stopper 其中一方關閉。
         source, handed = None, False
         try:
-            asr, prof, note = self._build_asr(s)
+            asr, asr_partial, prof, note = self._build_asr(s)
             if s.stop.is_set():
                 return
             mt, mt_note, mt_on_cpu = self._build_mt(prof)
@@ -318,7 +333,7 @@ class Pipeline:
                 if s.stop.is_set() or self._cur is not s:
                     return
                 s.source, handed = source, True
-                self._start_workers(s, asr, mt, mt_on_cpu, prof, source, vad, note)
+                self._start_workers(s, asr, asr_partial, mt, mt_on_cpu, prof, source, vad, note)
         except Exception as e:
             if not s.stop.is_set():
                 log.exception("啟動失敗")
@@ -331,16 +346,21 @@ class Pipeline:
                 except Exception:
                     log.exception("關閉音訊來源失敗")
 
-    def _start_workers(self, s: _Session, asr, mt, mt_on_cpu: bool, prof: Profile, source: AudioSource,
-                       vad, note: str) -> None:
+    def _start_workers(self, s: _Session, asr, asr_partial, mt, mt_on_cpu: bool, prof: Profile,
+                       source: AudioSource, vad, note: str) -> None:
         """呼叫端持有 self._lock。"""
-        s.asr, s.mt, s.mt_on_cpu, s.profile = asr, mt, mt_on_cpu, prof
+        s.asr, s.asr_partial, s.mt, s.mt_on_cpu, s.profile = asr, asr_partial, mt, mt_on_cpu, prof
         self._active_profile = prof
         seg_cfg = SegmenterConfig(max_segment_s=prof.max_segment_s, partial_interval_s=prof.partial_interval_s)
         workers = [
             threading.Thread(target=self._capture_loop, args=(s, source, vad, seg_cfg),
                              name="livesub-capture", daemon=True),
+        ] + ([
+            threading.Thread(target=self._final_loop, args=(s,), name="livesub-asr-final", daemon=True),
+            threading.Thread(target=self._partial_loop, args=(s,), name="livesub-asr-partial", daemon=True),
+        ] if asr_partial is not None else [
             threading.Thread(target=self._asr_loop, args=(s,), name="livesub-asr", daemon=True),
+        ]) + [
             threading.Thread(target=self._mt_loop, args=(s,), name="livesub-mt", daemon=True),
             threading.Thread(target=self._coord_loop, args=(s,), name="livesub-coord", daemon=True),
         ]
@@ -366,8 +386,25 @@ class Pipeline:
                 errors.append(f"{p.label}：{e}")
                 continue
             note = "" if p.name == self.profile.name else f"已自動退回「{p.label}」（{errors[0]}）"
-            return eng, p, note
+            if note and any("模型未下載" in e for e in errors):
+                note += "；請重新執行安裝程式（install.ps1）下載新版需要的模型"
+            peng, pnote = self._build_partial_asr(p)
+            return eng, peng, p, "；".join(x for x in (note, pnote) if x)
         raise RuntimeError("沒有可用的辨識模型：" + "；".join(errors))
+
+    def _build_partial_asr(self, p: Profile):
+        """邊講邊出字用的獨立引擎。回傳 (引擎或 None, 提示訊息)；失敗不影響啟動，退回與 final 共用引擎。"""
+        if not p.partial_model or p.partial_interval_s <= 0:
+            return None, ""
+        try:
+            if self._require_models and not models.is_downloaded(p.partial_model):
+                raise RuntimeError("模型未下載，請重新執行安裝程式")
+            eng = self._asr_factory(replace(p, asr_model=p.partial_model))
+            eng.transcribe(np.zeros(16000, np.float32), language="zh", final=False)
+            return eng, ""
+        except Exception as e:
+            log.warning("即時辨識模型 %s 無法使用（%s），改與定稿共用引擎", p.partial_model, e)
+            return None, f"即時辨識模型無法使用（{e}），改與定稿共用，出字會變慢"
 
     def _build_mt(self, p: Profile):
         """回傳 (翻譯器, 提示訊息, 是否已在 CPU 上)。"""
@@ -402,7 +439,8 @@ class Pipeline:
                 if len(frames) == 0:
                     continue
                 probs = vad.probs(frames)
-                if base_interval > 0:  # 自適應：partial 間隔不得短於近期推論耗時的 1.3 倍
+                if base_interval > 0 and s.asr_partial is None:
+                    # 與 final 共用引擎：partial 間隔不得短於近期推論耗時的 1.3 倍，免得擋住 final
                     seg.cfg.partial_interval_s = max(base_interval, 1.3 * s.partial_cost)
                 for ev in seg.feed(frames, probs):
                     self._submit(s, ev)
@@ -415,7 +453,10 @@ class Pipeline:
     def _submit(self, s: _Session, ev: SegEvent) -> None:
         now = self._clock()
         if ev.kind == "cancel":
+            self._end_utts(s, [ev.utt_id])
             s.events.put(_Cancel(ev.utt_id))
+            return
+        if ev.kind == "partial" and s.partials_off:
             return
         req = _Req(ev.kind, ev.utt_id, ev.audio, ev.voiced_ratio, now, ev.forced)
         with s.asr_cv:
@@ -429,7 +470,7 @@ class Pipeline:
                 s.final_q.append(req)
                 while len(s.final_q) > FINAL_QUEUE_MAX:
                     self._merge_oldest_finals(s)
-            s.asr_cv.notify()
+            s.asr_cv.notify_all()  # final 與 partial 兩條執行緒都在等
 
     @staticmethod
     def _merge_oldest_finals(s: _Session) -> None:
@@ -438,6 +479,7 @@ class Pipeline:
         b = s.final_q.popleft()
         s.stats["merged_finals"] += 1
         if (len(a.audio) + len(b.audio)) / 16000 > MAX_MERGED_S:
+            Pipeline._end_utts(s, a.merged_utts + [a.utt_id])
             for u in a.merged_utts + [a.utt_id]:
                 s.events.put(_Cancel(u))
             s.final_q.appendleft(b)
@@ -449,6 +491,7 @@ class Pipeline:
 
     # ---- ASR -----------------------------------------------------------
     def _asr_loop(self, s: _Session) -> None:
+        """共用引擎：單一 worker。每次推論前才決定跑什麼——final 優先，否則拿槽裡最新的 partial。"""
         while not s.stop.is_set():
             with s.asr_cv:
                 while not s.stop.is_set() and not s.final_q and s.partial_slot is None:
@@ -459,28 +502,93 @@ class Pipeline:
                     req = s.final_q.popleft()
                 else:
                     req, s.partial_slot = s.partial_slot, None
-            try:
-                res = self._run_asr(s, req)
-            except Exception as e:
-                s.stats["asr_errors"] += 1
-                if req.kind == "partial":
-                    # partial 失敗只是少一次預覽：不封鎖這段，也不計入失敗門檻，交給 final 處理
-                    log.warning("partial 辨識失敗：%s", e)
-                    continue
-                log.exception("辨識失敗")
-                s.asr_errors += 1
-                for u in req.merged_utts + [req.utt_id]:  # 清掉這段的 partial，避免永遠不淡出
-                    s.events.put(_Cancel(u))
-                if s.asr_errors >= MAX_ASR_ERRORS:
-                    self._fail(s, f"辨識持續失敗：{e}")
+            if req.kind == "final":
+                if not self._do_final(s, req):
                     return
-                s.events.put(("message", f"辨識失敗：{e}"))
-                continue
-            if req.kind == "final":  # 只有 final 成功才算恢復（partial 能跑不代表 final 能跑）
-                s.asr_errors = 0
-            for u in req.merged_utts:
+            else:
+                self._do_partial(s, req)
+
+    def _final_loop(self, s: _Session) -> None:
+        """獨立引擎模式的 final worker。"""
+        while not s.stop.is_set():
+            with s.asr_cv:
+                while not s.stop.is_set() and not s.final_q:
+                    s.asr_cv.wait(timeout=0.5)
+                if s.stop.is_set():
+                    return
+                req = s.final_q.popleft()
+            if not self._do_final(s, req):
+                return
+
+    def _partial_loop(self, s: _Session) -> None:
+        """獨立引擎模式的 partial worker：引擎一空就拿最新的音訊。"""
+        while not s.stop.is_set() and not s.partials_off:
+            with s.asr_cv:
+                while not s.stop.is_set() and s.partial_slot is None:
+                    s.asr_cv.wait(timeout=0.5)
+                if s.stop.is_set():
+                    return
+                req, s.partial_slot = s.partial_slot, None
+            self._do_partial(s, req)
+
+    def _do_final(self, s: _Session, req: _Req) -> bool:
+        """跑一次 final。回傳 False 表示這次工作已判定失敗，worker 應結束。"""
+        try:
+            res = self._run_asr(s, req)
+        except Exception as e:
+            log.exception("辨識失敗")
+            s.stats["asr_errors"] += 1
+            s.asr_errors += 1
+            for u in req.merged_utts + [req.utt_id]:  # 清掉這段的 partial，避免永遠不淡出
                 s.events.put(_Cancel(u))
-            s.events.put(_AsrDone(req.kind, req.utt_id, res, req.voiced_ratio, req.emitted_at, req.forced))
+            self._end_utts(s, req.merged_utts + [req.utt_id])
+            if s.asr_errors >= MAX_ASR_ERRORS:
+                self._fail(s, f"辨識持續失敗：{e}")
+                return False
+            s.events.put(("message", f"辨識失敗：{e}"))
+            return True
+        s.asr_errors = 0  # 只有 final 成功才算恢復（partial 能跑不代表 final 能跑）
+        for u in req.merged_utts:
+            s.events.put(_Cancel(u))
+        s.events.put(_AsrDone(req.kind, req.utt_id, res, req.voiced_ratio, req.emitted_at, req.forced))
+        return True
+
+    def _do_partial(self, s: _Session, req: _Req) -> None:
+        try:
+            res = self._run_asr(s, req)
+        except Exception as e:
+            # partial 失敗只是少一次預覽：不封鎖這段，也不計入 final 的失敗門檻
+            s.stats["partial_errors"] += 1
+            s.partial_errors += 1
+            if s.partial_errors == 1:
+                log.warning("partial 辨識失敗：%s", e)
+            if s.asr_partial is not None and s.partial_errors >= MAX_PARTIAL_ERRORS:
+                s.partials_off = True  # 獨立引擎壞了：停用即時辨識，定稿照常
+                log.error("即時辨識引擎連續失敗 %d 次，停用：%s", s.partial_errors, e)
+                s.events.put(("message", f"即時辨識引擎故障（{e}），改為只顯示定稿字幕"))
+            return
+        s.partial_errors = 0
+        s.events.put(_AsrDone(req.kind, req.utt_id, res, req.voiced_ratio, req.emitted_at, req.forced))
+
+    @staticmethod
+    def _end_utts(s: _Session, utts: list[int]) -> None:
+        """這些段落不會有成功的 final：清掉語言快取，之後晚到的 partial 也不得再寫入。
+
+        只記錄這幾段，不推進 max_final_utt，以免封鎖仍在辨識中的較舊段落。
+        """
+        with s.ctx_lock:
+            for u in utts:
+                s.utt_lang.pop(u, None)
+                s.ended_utts.add(u)
+            if len(s.ended_utts) > 256:
+                s.ended_utts = {u for u in s.ended_utts if u > s.max_final_utt}
+            if len(s.utt_lang) > 64:
+                s.utt_lang.clear()
+
+    def _transcribe(self, s: _Session, req: _Req, **kw) -> AsrResult:
+        if req.kind == "partial" and s.asr_partial is not None:
+            return s.asr_partial.transcribe(req.audio, final=False, **kw)
+        return s.asr.transcribe(req.audio, final=req.kind == "final", **kw)
 
     def _run_asr(self, s: _Session, req: _Req) -> AsrResult:
         src = self.settings.audio.source_language
@@ -489,7 +597,8 @@ class Pipeline:
         else:
             # 自動模式：語言只信「這一句」不帶 prompt 的 partial 偵測結果。
             # 不知道語言時完全不給 prompt——中文提示會把英文句子帶偏（漏字、出現全形字元）。
-            hint = s.utt_lang.get(req.utt_id)
+            with s.ctx_lock:
+                hint = s.utt_lang.get(req.utt_id)
             language = hint if req.kind == "partial" else None
         if self._clock() - s.last_final_t > CONTEXT_RESET_S:
             s.prompt_ctx, s.prompt_lang = "", None
@@ -498,16 +607,20 @@ class Pipeline:
         budget = PROMPT_MAX_CHARS - len(static) - 1
         ctx = ctx[-budget:] if budget > 0 else ""  # 固定提示保留，上下文從尾端截
         prompt = " ".join(x for x in (static, ctx) if x) or None
-        res = s.asr.transcribe(req.audio, language=language, prompt=prompt, final=req.kind == "final")
-        if req.kind == "partial":
-            s.partial_cost = res.seconds if s.partial_cost == 0 else 0.7 * s.partial_cost + 0.3 * res.seconds
-            if res.language in ("zh", "en"):
-                s.utt_lang.setdefault(req.utt_id, res.language)
-        else:
-            for u in req.merged_utts + [req.utt_id]:
-                s.utt_lang.pop(u, None)
-            if len(s.utt_lang) > 64:
-                s.utt_lang.clear()
+        res = self._transcribe(s, req, language=language, prompt=prompt)
+        with s.ctx_lock:
+            if req.kind == "partial":
+                s.partial_cost = res.seconds if s.partial_cost == 0 else 0.7 * s.partial_cost + 0.3 * res.seconds
+                # 太短的音訊語言判斷不可靠；已定稿的段落不再寫入（晚到的 partial）
+                if (res.language in ("zh", "en") and len(req.audio) >= LANG_HINT_MIN_S * 16000
+                        and req.utt_id > s.max_final_utt and req.utt_id not in s.ended_utts):
+                    s.utt_lang.setdefault(req.utt_id, res.language)
+            else:
+                s.max_final_utt = max(s.max_final_utt, req.utt_id)
+                for u in req.merged_utts + [req.utt_id]:
+                    s.utt_lang.pop(u, None)
+                if len(s.utt_lang) > 64:
+                    s.utt_lang.clear()
         return res
 
     # ---- 翻譯 ----------------------------------------------------------
@@ -592,8 +705,8 @@ class Pipeline:
         if ev.kind == "partial":
             s.stats["partials"] += 1
             text = textproc.clean(r.text, confident=True, taiwan_phrases=tw)
-            if text:
-                s.board.set_partial(ev.utt_id, text, textproc.detect_lang(text, r.language))
+            if text and s.board.set_partial(ev.utt_id, text, textproc.detect_lang(text, r.language)):
+                s.partial_latencies.append(self._clock() - ev.emitted_at)
             return
         s.stats["finals"] += 1
         low_conf = ((r.no_speech_prob is not None and r.no_speech_prob > 0.5)
@@ -649,13 +762,22 @@ class Pipeline:
         s = self._cur
         return PipelineStatus(
             state=self._state, profile=p.name, profile_label=p.label,
-            asr_model=getattr(s.asr if s else None, "name", p.asr_model),
+            asr_model=self._asr_label(s, p),
             latency_s=self._median(s.latencies) if s else None,
             mt_latency_s=self._median(s.mt_latencies) if s else None,
+            partial_latency_s=self._median(s.partial_latencies) if s else None,
             level=s.level if s else 0.0,
             overflows=int(getattr(s.source, "overflows", 0) or 0) if s else 0, segmented=p.partial_interval_s == 0 or p.asr_device == "cpu",
             message=self._message,
         )
+
+    @staticmethod
+    def _asr_label(s: _Session | None, p: Profile) -> str:
+        """實際使用的模型；有獨立 partial 引擎時附上（例如「small＋即時 base」）。"""
+        name = getattr(s.asr if s else None, "name", p.asr_model)
+        if s is not None and s.asr_partial is not None:
+            return f"{name}＋即時 {getattr(s.asr_partial, 'name', p.partial_model)}"
+        return name
 
     def _emit_status(self, force: bool = False) -> None:
         with self._lock:

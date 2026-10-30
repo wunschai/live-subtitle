@@ -316,8 +316,10 @@ class ControlPanel(QWidget):
         parts = [STATE_LABELS[status.state]]
         if status.profile_label:
             parts.append(status.profile_label)
+        if status.partial_latency_s is not None and math.isfinite(status.partial_latency_s):
+            parts.append(f"即時 {max(0.0, status.partial_latency_s):.1f} 秒")
         if status.latency_s is not None and math.isfinite(status.latency_s):
-            lat = f"延遲 {max(0.0, status.latency_s):.1f} 秒"
+            lat = f"定稿 {max(0.0, status.latency_s):.1f} 秒"
             if status.mt_latency_s is not None and math.isfinite(status.mt_latency_s):
                 lat += f"（譯 +{max(0.0, status.mt_latency_s):.1f} 秒）"
             parts.append(lat)

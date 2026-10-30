@@ -16,12 +16,14 @@ class Profile:
     asr_device: str  # "cuda" / "cpu" / "GPU"（OpenVINO 裝置名）
     asr_compute_type: str  # faster-whisper 的 compute_type；OpenVINO 不用
     beam_final: int
-    partial_interval_s: float  # 0 = 不出 partial
+    partial_interval_s: float  # 0 = 不出 partial；有獨立 partial 引擎時是「最短間隔」，引擎一空就接著跑
     mt_device: str  # "cuda" / "cpu"
     mt_compute_type: str
     cpu_threads: int = 0  # 0 = 自動
     max_segment_s: float = 8.0
     fallback: str | None = None  # 初始化或校正失敗時退到哪一級
+    # 邊講邊出字用的獨立模型（另開一個引擎、另一條執行緒，不與 final 排隊）。空字串 = 與 final 共用引擎。
+    partial_model: str = ""
     extra: str = "none"  # 需要的 pyproject extra
 
     def to_dict(self) -> dict:
@@ -30,19 +32,20 @@ class Profile:
 
 PROFILES: dict[str, Profile] = {p.name: p for p in [
     Profile("nvidia-high", "NVIDIA 高階（VRAM ≥ 8GB）", "faster-whisper", "breeze-asr-25", "cuda", "float16",
-            beam_final=5, partial_interval_s=0.6, mt_device="cuda", mt_compute_type="float16",
+            beam_final=5, partial_interval_s=0.3, mt_device="cuda", mt_compute_type="float16",
             fallback="nvidia-mid", extra="cuda"),
     Profile("nvidia-mid", "NVIDIA 中階（VRAM 4–8GB）", "faster-whisper", "whisper-large-v3-turbo", "cuda",
-            "int8_float16", beam_final=3, partial_interval_s=0.8, mt_device="cuda", mt_compute_type="int8_float16",
+            "int8_float16", beam_final=3, partial_interval_s=0.3, mt_device="cuda", mt_compute_type="int8_float16",
             fallback="nvidia-low", extra="cuda"),
     Profile("nvidia-low", "NVIDIA 入門（VRAM < 4GB）", "faster-whisper", "whisper-small", "cuda", "int8_float16",
-            beam_final=3, partial_interval_s=0.8, mt_device="cpu", mt_compute_type="int8",
+            beam_final=3, partial_interval_s=0.3, mt_device="cpu", mt_compute_type="int8",
             fallback="cpu-high", extra="cuda"),
-    Profile("intel-gpu", "Intel 內顯（OpenVINO）", "openvino", "ov-whisper-large-v3-turbo", "GPU", "",
-            beam_final=1, partial_interval_s=1.5, mt_device="cpu", mt_compute_type="int8",
-            fallback="intel-gpu-lite", extra="intel"),
-    Profile("intel-gpu-lite", "Intel 內顯輕量（OpenVINO）", "openvino", "ov-whisper-small", "GPU", "",
-            beam_final=1, partial_interval_s=1.0, mt_device="cpu", mt_compute_type="int8",
+    # 內顯：turbo 定稿時會佔滿 GPU，讓邊講邊出字卡到 3 秒；改成 small 定稿＋base 即時，兩者並行互不阻塞
+    Profile("intel-gpu", "Intel 內顯（OpenVINO）", "openvino", "ov-whisper-small", "GPU", "",
+            beam_final=1, partial_interval_s=0.2, mt_device="cpu", mt_compute_type="int8",
+            fallback="intel-gpu-lite", extra="intel", partial_model="ov-whisper-base"),
+    Profile("intel-gpu-lite", "Intel 內顯輕量（OpenVINO）", "openvino", "ov-whisper-base", "GPU", "",
+            beam_final=1, partial_interval_s=0.3, mt_device="cpu", mt_compute_type="int8",
             fallback="cpu-high", extra="intel"),
     Profile("cpu-high", "CPU（6 核以上）", "faster-whisper", "whisper-small", "cpu", "int8",
             beam_final=1, partial_interval_s=0.0, mt_device="cpu", mt_compute_type="int8",
@@ -69,7 +72,8 @@ def select_profile(hw: HardwareInfo, openvino_gpu: bool | None = None) -> Profil
             p = PROFILES["nvidia-low"]
     elif (hw.intel_gpu is not None and hw.arch == "x86_64" and hw.os in ("windows", "linux")
           and openvino_gpu is not False):
-        p = PROFILES["intel-gpu"] if hw.ram_gb >= 15 else PROFILES["intel-gpu-lite"]
+        # small＋base 合計不到 400 MB，一般筆電都放得下；lite 只當校正太慢時的退路
+        p = PROFILES["intel-gpu"] if hw.ram_gb >= 7.5 else PROFILES["intel-gpu-lite"]
     elif hw.physical_cores >= 6 and hw.ram_gb >= 7.5:
         p = PROFILES["cpu-high"]
     else:

@@ -61,19 +61,28 @@ macOS / Linux 執行 `sh install.sh`，目前以 CPU 模式為主。
 
 ## 硬體等級
 
-| 等級 | 條件 | 辨識模型 | 延遲目標 |
+| 等級 | 條件 | 定稿模型 | 邊講邊出字 |
 |---|---|---|---|
-| nvidia-high | NVIDIA VRAM ≥ 8 GB | Breeze-ASR-25（MediaTek，繁中與中英夾雜強化） | ≤ 1.5 秒 |
-| nvidia-mid | NVIDIA 4–8 GB | Whisper large-v3-turbo | ≤ 1.5 秒 |
-| nvidia-low | NVIDIA < 4 GB | Whisper small | ≤ 1.5 秒 |
-| intel-gpu | Intel Arc / Iris Xe 內顯，RAM ≥ 16 GB | Whisper large-v3-turbo（OpenVINO） | ≤ 2.5 秒 |
-| intel-gpu-lite | Intel 內顯，RAM < 16 GB | Whisper small（OpenVINO） | ≤ 2.0 秒 |
-| cpu-high | 6 核以上 | Whisper small | ≤ 4 秒（分段字幕） |
-| cpu-low | 其他 | Whisper base | ≤ 4 秒（分段字幕） |
+| nvidia-high | NVIDIA VRAM ≥ 8 GB | Breeze-ASR-25（MediaTek，繁中與中英夾雜強化） | 同一模型，每 0.3 秒 |
+| nvidia-mid | NVIDIA 4–8 GB | Whisper large-v3-turbo | 同一模型，每 0.3 秒 |
+| nvidia-low | NVIDIA < 4 GB | Whisper small | 同一模型，每 0.3 秒 |
+| intel-gpu | Intel Arc / Iris Xe 內顯 | Whisper small（OpenVINO） | Whisper base，獨立引擎並行 |
+| intel-gpu-lite | 內顯太慢或記憶體 < 8 GB | Whisper base（OpenVINO） | 同一模型，每 0.3 秒 |
+| cpu-high | 6 核以上 | Whisper small | 無（分段字幕） |
+| cpu-low | 其他 | Whisper base | 每 2 秒 |
 
-延遲是從講者停頓到字幕出現的時間，實際數值會顯示在面板上。翻譯所有等級都使用 [quickmt](https://huggingface.co/quickmt)，每句約 0.05–0.1 秒。
+說話時字幕會先以淡色出現（「即時」），講完一句後換成定稿文字並附上翻譯。面板會顯示兩種延遲：
 
-**實測**：在 Intel Core Ultra 7 155H 加 Arc 內顯上，自動選擇 `intel-gpu`，延遲中位數約 2.0 秒。
+- **即時**：音訊送出到淡色字出現。
+- **定稿**：講者停頓到定稿字幕出現（含 0.5 秒的句尾等待）。
+
+翻譯所有等級都使用 [quickmt](https://huggingface.co/quickmt)，每句約 0.1–0.2 秒。
+
+**實測**：在 Intel Core Ultra 7 155H 加 Arc 內顯上，自動選擇 `intel-gpu`。用麥克風實測，即時中位數 0.34 秒，定稿中位數 1.25 秒。
+
+內顯為什麼不用 turbo：turbo 定稿時會佔滿顯示卡，讓邊講邊出字卡到 3 秒，所以改用 small 定稿、base 即時，兩個引擎並行。
+
+**從舊版升級**：新版的內顯等級需要新的模型，請重新執行 `install.ps1`。沒有重跑的話，程式會退回較慢的等級，並在面板上提示。
 
 如果加速裝置初始化失敗（例如驅動問題），程式會自動退回下一個等級，最後一定能用 CPU 保底模型。
 
