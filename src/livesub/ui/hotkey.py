@@ -1,16 +1,21 @@
-"""全域熱鍵（Windows RegisterHotKey）。其他平台回報不支援，改由系統匣操作。"""
+"""全域熱鍵（Windows RegisterHotKey）。其他平台回報不支援，改由系統匣操作。
+
+實測 Qt 的事件迴圈收不到 RegisterHotKey 的執行緒訊息（WM_HOTKEY 在 native event filter 前就被吃掉），
+所以熱鍵放在一條獨立執行緒，自己跑 Win32 訊息迴圈（GetMessageW），收到後用 Qt signal 轉回主執行緒。
+"""
 
 from __future__ import annotations
 
 import logging
 import sys
+import threading
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Signal
+from PySide6.QtCore import QObject, Signal
 
 log = logging.getLogger(__name__)
 
 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
-WM_HOTKEY = 0x0312
+WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 
 # id → (修飾鍵, 虛擬鍵碼, 名稱)
 HOTKEYS = {
@@ -19,61 +24,65 @@ HOTKEYS = {
 }
 
 
-class _Filter(QAbstractNativeEventFilter):
-    def __init__(self, callback):
-        super().__init__()
-        self._cb = callback
-
-    def nativeEventFilter(self, event_type, message):
-        if event_type in (b"windows_generic_MSG", "windows_generic_MSG"):
-            from ctypes import wintypes
-
-            msg = wintypes.MSG.from_address(int(message))
-            if msg.message == WM_HOTKEY:
-                self._cb(int(msg.wParam))
-                return True, 0
-        return False, 0
-
-
 class HotkeyManager(QObject):
-    triggered = Signal(str)  # "toggle_panel" / "start_stop"
+    triggered = Signal(str)  # "toggle_panel" / "start_stop"；從熱鍵執行緒 emit，Qt 自動排回主執行緒
 
-    def __init__(self, app):
+    def __init__(self, app=None):
         super().__init__()
-        self._app = app
-        self._registered: list[int] = []
-        self._filter = None
+        self._thread: threading.Thread | None = None
+        self._tid = 0
+        self._ok = False
 
-    def register(self) -> bool:
-        """全部註冊成功才回傳 True（例如被其他程式佔用就會失敗）。"""
-        if sys.platform != "win32":
-            return False
+    def register(self, timeout: float = 3.0) -> bool:
+        """全部註冊成功才回傳 True（例如被其他程式佔用就會失敗，並全部撤銷）。"""
+        if sys.platform != "win32" or self._thread is not None:
+            return self._ok
+        ready = threading.Event()
+        self._thread = threading.Thread(target=self._loop, args=(ready,), name="livesub-hotkeys", daemon=True)
+        self._thread.start()
+        ready.wait(timeout)
+        if not self._ok:
+            self.unregister()
+        return self._ok
+
+    def _loop(self, ready: threading.Event) -> None:
         import ctypes
+        from ctypes import wintypes
 
         user32 = ctypes.windll.user32
-        self._filter = _Filter(self._on_hotkey)
-        self._app.installNativeEventFilter(self._filter)
-        ok = True
+        self._tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        msg = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)  # 建立這條執行緒的訊息佇列
+        registered = []
         for hid, (mods, vk, name) in HOTKEYS.items():
             if user32.RegisterHotKey(None, hid, mods | MOD_NOREPEAT, vk):
-                self._registered.append(hid)
+                registered.append(hid)
             else:
                 log.warning("熱鍵 %s 註冊失敗（可能被其他程式佔用）", name)
-                ok = False
-        return ok
+                break
+        self._ok = len(registered) == len(HOTKEYS)
+        ready.set()
+        try:
+            if self._ok:
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    if msg.message == WM_HOTKEY and int(msg.wParam) in HOTKEYS:
+                        self.triggered.emit(HOTKEYS[int(msg.wParam)][2])
+        finally:
+            for hid in registered:  # RegisterHotKey 綁執行緒，必須在同一條執行緒撤銷
+                user32.UnregisterHotKey(None, hid)
 
-    def _on_hotkey(self, hid: int) -> None:
-        if hid in HOTKEYS:
-            self.triggered.emit(HOTKEYS[hid][2])
+    @property
+    def thread_id(self) -> int:
+        return self._tid
 
     def unregister(self) -> None:
-        if sys.platform != "win32":
+        t, self._thread = self._thread, None
+        if t is None:
             return
-        import ctypes
+        if t.is_alive() and self._tid:
+            import ctypes
 
-        for hid in self._registered:
-            ctypes.windll.user32.UnregisterHotKey(None, hid)
-        self._registered.clear()
-        if self._filter is not None:
-            self._app.removeNativeEventFilter(self._filter)
-            self._filter = None
+            ctypes.windll.user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+            t.join(timeout=2)
+        self._ok = False
+        self._tid = 0

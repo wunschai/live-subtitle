@@ -80,8 +80,10 @@ def is_hallucination(text: str, confident: bool = True, threshold: float = 0.85)
 
 def collapse_repeats(text: str) -> str:
     """截斷解碼迴圈：同一字元或 2–8 字的片段連續出現 ≥4 次只留 1 次（3 次以內視為正常強調）。"""
-    t = re.sub(r"(.)\1{3,}", r"\1", text)
-    t = re.sub(r"(.{2,8}?)(?:\s*\1){3,}", r"\1", t)
+    # 數字不處理：10000、0800000123 是正常內容，不是迴圈
+    t = re.sub(r"(?!\d)(.)\1{3,}", r"\1", text)
+    t = re.sub(r"(.{2,8}?)(?:\s*\1){3,}",
+               lambda m: m.group(0) if re.fullmatch(r"[\d\W_]+", m.group(1)) else m.group(1), t)
     # 英文以單字為單位：the the the the → the
     t = re.sub(r"\b((?:\w+\W+){1,4}?)(?:\1){3,}", r"\1", t + " ").rstrip()
     return t

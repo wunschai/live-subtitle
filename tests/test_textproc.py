@@ -65,3 +65,14 @@ def test_detect_lang_hint_for_empty():
 def test_clean_converts_and_formats():
     assert tp.clean("大家好,欢迎参加今天的工作坊。") == "大家好，歡迎參加今天的工作坊。"
     assert tp.clean(" Good morning everyone. ") == "Good morning everyone."
+
+
+@pytest.mark.parametrize("text", [
+    "預算是10000元", "人口大約23000000人", "The price is 10000 dollars.", "電話0800000123",
+    "代碼12121212", "版本 1.1.1.1", "2000年",
+])
+def test_numbers_are_never_collapsed(text):
+    """回歸：審查員 A 發現 10000 被截成 10（字幕數字錯一個數量級）。"""
+    assert tp.collapse_repeats(text) == text
+    assert any(ch.isdigit() for ch in tp.clean(text))
+    assert "".join(c for c in tp.clean(text) if c.isdigit()) == "".join(c for c in text if c.isdigit())

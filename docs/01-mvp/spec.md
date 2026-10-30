@@ -51,7 +51,7 @@
 |---|---|
 | 1 | `select_profile` 對 plan 等級表中每一列的條件都回傳正確的等級（表格驅動測試）。 |
 | 2 | `install.ps1` 在沒有 uv 的電腦上會先安裝 uv。extra 是 `none` 時不帶 extra 參數。整個流程不需要系統管理員權限。 |
-| 3 | `livesub-setup` 會下載該等級的模型與 CPU 保底模型，實際載入並跑一次推論和校正；不達標就沿 fallback 鏈降級，結果寫入 config 的 `[setup]` 區段。 |
+| 3 | `livesub-setup` 會下載該等級的模型與 CPU 保底模型，實際載入並跑一次推論和校正（速度＋辨識相似度）；不達標就沿 fallback 鏈降級。選定的等級與 `cpu_threads` 寫入 config 的 `[runtime]`，完整探測紀錄寫入同資料夾的 `setup.json`。 |
 | 4 | 執行期 ASR 初始化失敗時，沿 fallback 鏈自動退到第一個模型已下載的等級，並在面板上顯示警告。 |
 | 5 | 設定 `HF_HUB_OFFLINE=1` 時，啟動和推論都正常（模型已在本機）。 |
 

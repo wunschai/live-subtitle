@@ -265,8 +265,8 @@ def test_slow_asr_backlog_is_bounded():
     p.start()
     assert wait_for(lambda: p.state == PipelineState.RUNNING)
     time.sleep(0.5)
-    assert len(p._final_q) <= 4
-    assert wait_for(lambda: not p._final_q and p.stats["merged_finals"] > 0, timeout=15)
+    assert len(p._cur.final_q) <= 4
+    assert wait_for(lambda: not p._cur.final_q and p.stats["merged_finals"] > 0, timeout=15)
     assert asr.n < 30  # 有合併
     p.stop(wait=True)
 
@@ -277,8 +277,8 @@ def test_long_run_memory_bounded():
     p.start()
     assert wait_for(lambda: asr.n >= 150, timeout=30)
     assert len(p.board.lines) <= p.board.keep_lines
-    assert len(p._utt_lang) <= 64
-    assert len(p._mt_q) <= 6
+    assert len(p._cur.utt_lang) <= 64
+    assert len(p._cur.mt_q) <= 6
     assert len(p.board._finalized_utts) <= 320
     p.stop(wait=True)
 
@@ -311,4 +311,120 @@ def test_hallucinated_finals_are_not_shown(bad):
     assert wait_for(lambda: asr.n >= 3)
     time.sleep(0.3)
     assert rec.last.empty and mt.calls == []
+    p.stop(wait=True)
+
+
+# ---- 審查回歸測試（docs/reviews/02-code-review-codex.md） --------------------------
+
+def test_restart_accepts_partials_from_new_session():
+    """重啟後 utt_id 從 1 重新開始：新工作階段的 partial 不能被上一場的紀錄擋掉。"""
+    asr = FakeASR(partial_delay=0.01)
+    p, rec, *_ = make([(0.3, False)] + [(2.0, True), (0.8, False)] * 3, asr=asr, profile="intel-gpu-lite",
+                      mode="zh", rt=1.0)
+    p.start()
+    assert wait_for(lambda: asr.n >= 2, timeout=15)
+    p.stop(wait=True)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    assert wait_for(lambda: p.board.partial is not None or p.stats["partials"] > 0, timeout=10)
+    assert p.board.partial is None or p.board.partial.utt_id >= 1
+    assert wait_for(lambda: any(sp.text == "說話中" for b in rec.last.blocks for sp in b.spans), timeout=10)
+    p.stop(wait=True)
+
+
+def test_stuck_inference_blocks_restart_until_finished(monkeypatch):
+    import livesub.core.pipeline as P
+
+    monkeypatch.setattr(P, "JOIN_TIMEOUT_S", 0.5)
+    gate = threading.Event()
+
+    class StuckASR(FakeASR):
+        def transcribe(self, audio, language=None, prompt=None, final=True):
+            if final:
+                gate.wait(10)
+            return super().transcribe(audio, language, prompt, final)
+
+    p, rec, *_ = make(SPEECH, asr=StuckASR())
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    time.sleep(0.5)  # 讓 ASR 卡在 final
+    p.stop(wait=True)
+    assert p.state == PipelineState.IDLE
+    p.start()
+    assert p.state == PipelineState.IDLE  # 舊推論沒結束，拒絕重啟
+    assert "還在結束中" in rec.statuses[-1].message
+    gate.set()
+    assert wait_for(lambda: not any(t.is_alive() for t in p._lingering), timeout=5)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    p.stop(wait=True)
+
+
+def test_persistent_asr_failure_goes_failed_and_clears_partial():
+    class BrokenASR(FakeASR):
+        def transcribe(self, audio, language=None, prompt=None, final=True):
+            if len(audio) == 16000 and not final:  # 暖機可以過
+                return AsrResult("", "zh", None, None, 0.0)
+            if not final:
+                return AsrResult("說話中", "zh", -0.2, 0.01, 0.0)
+            raise RuntimeError("GPU lost")
+
+    p, rec, *_ = make([(0.3, False)] + [(1.5, True), (0.8, False)] * 5, asr=BrokenASR(),
+                      profile="intel-gpu-lite", rt=1.0)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.FAILED, timeout=20)
+    assert "辨識持續失敗" in rec.statuses[-1].message
+    assert rec.last.empty
+
+
+def test_capture_error_goes_failed():
+    class BadSource(FakeSource):
+        def read(self, timeout=0.2):
+            raise OSError("麥克風被拔掉")
+
+    s = Settings()
+    rec = Recorder()
+    p = Pipeline(s, profiles.get("cpu-high"), rec.snap, rec.status, source_factory=lambda _s: BadSource([]),
+                 asr_factory=lambda _p: FakeASR(), mt_factory=lambda _p, _s: FakeMT(), vad_factory=FakeVAD,
+                 require_models=False)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.FAILED)
+    assert "收音錯誤" in rec.statuses[-1].message
+
+
+def test_warmup_failure_falls_back_to_next_profile():
+    good = FakeASR()
+
+    class DeadOnInference(FakeASR):
+        def transcribe(self, *a, **k):
+            raise RuntimeError("kernel compile failed")
+
+    p, rec, *_ = make(SPEECH, profile="intel-gpu",
+                      asr_factory=lambda prof: DeadOnInference() if prof.name == "intel-gpu" else good)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    assert p.active_profile.name == "intel-gpu-lite"
+    p.stop(wait=True)
+
+
+def test_translator_falls_back_to_cpu():
+    devices = []
+
+    def mt_factory(prof, _s):
+        devices.append(prof.mt_device)
+        if prof.mt_device == "cuda":
+            raise RuntimeError("CUDA OOM")
+        return FakeMT()
+
+    s = Settings()
+    s.display.clear_after_s = 0
+    rec = Recorder()
+    p = Pipeline(s, profiles.get("nvidia-mid"), rec.snap, rec.status,
+                 source_factory=lambda _s: FakeSource(SPEECH), asr_factory=lambda _p: FakeASR(),
+                 mt_factory=mt_factory, vad_factory=FakeVAD, require_models=False)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    assert devices == ["cuda", "cpu"]
+    assert wait_for(lambda: rec.last and "[en]" in rec.last.blocks[1].text)
+    assert wait_for(lambda: any(st.mt_latency_s is not None for st in rec.statuses))
     p.stop(wait=True)

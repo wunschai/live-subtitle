@@ -173,3 +173,54 @@ def test_dim_and_unicode_spans(overlay):
     assert any(dim for _, dim in overlay._paths)
     assert any(not dim for _, dim in overlay._paths)
     assert not overlay.grab().isNull()
+
+
+# ---- 整句截斷（審查回合 2：第一行不可從句子中間開始） ------------------------
+
+def _block_snapshot(lang, parts, partial=None):
+    spans = []
+    joiner = " " if lang == "en" else ""
+    for i, t in enumerate(parts):
+        if i:
+            spans.append(Span(joiner))
+        spans.append(Span(t))
+    if partial:
+        spans += [Span(joiner, dim=True), Span(partial, dim=True)]
+    return BoardSnapshot(blocks=(Block(lang, tuple(spans)),), visible=True, revision=1)
+
+
+def _narrow(overlay, max_lines=2):
+    overlay.apply_settings(replace(overlay._settings, width_pct=50, font_size=24, max_lines=max_lines))
+
+
+def test_overflow_drops_whole_old_sentences_en(overlay):
+    _narrow(overlay)
+    sents = [f"Sentence number {i} is short." for i in range(12)]
+    overlay.show_snapshot(_block_snapshot("en", sents))
+    shown = overlay._visible_texts[0]
+    assert shown.startswith("Sentence number"), shown  # 從句首開始
+    assert shown.endswith(sents[-1])  # 最新一句一定在
+    assert sents[0] not in shown  # 舊的整句被丟掉
+
+
+def test_overflow_drops_whole_old_sentences_zh_with_partial(overlay):
+    _narrow(overlay)
+    sents = [f"第{i}句介紹資料庫。" for i in range(12)]
+    overlay.show_snapshot(_block_snapshot("zh", sents, partial="接下來看第二個部分"))
+    shown = overlay._visible_texts[0]
+    assert shown.startswith("第"), shown
+    assert shown.endswith("接下來看第二個部分")
+    assert "第0句" not in shown
+
+
+def test_single_sentence_too_long_keeps_its_tail(overlay):
+    _narrow(overlay, max_lines=1)
+    long = "This one sentence is far too long to fit on a single narrow line so only its tail is shown END"
+    overlay.show_snapshot(_block_snapshot("en", ["Old.", long]))
+    shown = overlay._visible_texts[0]
+    assert shown.rstrip().endswith("END") and "Old." not in shown
+
+
+def test_short_content_shown_whole(overlay):
+    overlay.show_snapshot(_block_snapshot("en", ["Hello.", "World."]))
+    assert overlay._visible_texts[0] == "Hello. World."

@@ -11,6 +11,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$logFile = Join-Path $PSScriptRoot "install.log"
+try { Start-Transcript -Path $logFile -Force | Out-Null } catch { }
+
+# 右鍵「以 PowerShell 執行」時，出錯視窗會直接關掉：先停下來讓使用者看到訊息
+trap {
+    Write-Host "`n安裝失敗：$_" -ForegroundColor Red
+    Write-Host "完整紀錄：$logFile"
+    try { Stop-Transcript | Out-Null } catch { }
+    Read-Host "按 Enter 關閉視窗"
+    exit 1
+}
 $env:PYTHONIOENCODING = "utf-8"
 $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
 Set-Location -LiteralPath $PSScriptRoot
@@ -55,4 +66,6 @@ if ($NoShortcut) { $setupArgs += "--no-shortcut" }
 if ($LASTEXITCODE -ne 0) { throw "設定失敗" }
 
 Step "完成"
-Write-Host "從桌面的「即時字幕」捷徑啟動，或執行：.\.venv\Scripts\pythonw.exe -m livesub"
+Write-Host "從桌面或開始選單的「即時字幕」捷徑啟動，或執行：.\.venv\Scripts\pythonw.exe -m livesub"
+try { Stop-Transcript | Out-Null } catch { }
+Read-Host "按 Enter 關閉視窗"

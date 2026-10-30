@@ -19,7 +19,8 @@ def config_dir() -> Path:
         return h
     from platformdirs import user_config_dir
 
-    return Path(user_config_dir(APP, appauthor=False, roaming=True))
+    # 不漫遊：等級與硬體綁定，網域漫遊設定檔會把 A 機的等級帶到 B 機
+    return Path(user_config_dir(APP, appauthor=False, roaming=False))
 
 
 def data_dir() -> Path:

@@ -47,11 +47,12 @@ def bench_audio() -> tuple[np.ndarray, str | None]:
             "if($v){$s.SelectVoice($v.VoiceInfo.Name)};"
             "$f=New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000,"
             "[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen,[System.Speech.AudioFormat.AudioChannel]::Mono);"
-            f"$s.SetOutputToWaveFile('{out}',$f);$s.Speak('{BENCH_TEXT}');$s.Dispose()"
+            "$s.SetOutputToWaveFile($env:LIVESUB_WAV,$f);$s.Speak($env:LIVESUB_TEXT);$s.Dispose()"
         )
+        env = {**os.environ, "LIVESUB_WAV": str(out), "LIVESUB_TEXT": BENCH_TEXT}  # 路徑含引號也安全
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=60, capture_output=True,
-                           creationflags=0x08000000)
+                           creationflags=0x08000000, env=env)
         except (OSError, subprocess.SubprocessError):
             pass
     if out.exists() and out.stat().st_size > 10000:
@@ -65,8 +66,30 @@ def bench_audio() -> tuple[np.ndarray, str | None]:
 
 def ensure_models(p: Profile) -> None:
     for key in dict.fromkeys([p.asr_model, SAFETY_MODEL, "mt-zh-en", "mt-en-zh"]):
-        if not models.is_downloaded(key):
+        if models.is_downloaded(key):
+            bad = models.verify(key)
+            if not bad:
+                continue
+            say(f"{key} 檔案損毀（{', '.join(bad)}），重新下載")
+            models.download(key, progress=say, force=True)
+        else:
             models.download(key, progress=say)
+
+
+MIN_SIMILARITY = 0.5
+
+
+def cuda_ready() -> bool:
+    """CTranslate2 是否真的能用 CUDA（驅動、cuBLAS/cuDNN 都要在）。下載大模型前先確認。"""
+    try:
+        from .core.asr import add_cuda_dll_dirs
+
+        add_cuda_dll_dirs()
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
 
 
 def probe(p: Profile, audio: np.ndarray, expected: str | None) -> dict:
@@ -114,6 +137,9 @@ def choose(hw: hardware.HardwareInfo, forced: str | None, skip_bench: bool) -> t
     else:
         ov = profiles.probe_openvino_gpu() if hw.intel_gpu else None
         p = profiles.select_profile(hw, ov)
+        if p.asr_device == "cuda" and not cuda_ready():
+            say("偵測到 NVIDIA 顯示卡，但 CUDA 無法使用（驅動或函式庫問題），改用 CPU 等級")
+            p = profiles.select_profile(replace(hw, gpus=[g for g in hw.gpus if g.vendor != "nvidia"]), ov)
     say(f"初步等級：{p.name}（{p.label}）")
     audio, expected = bench_audio()
     log = []
@@ -127,9 +153,14 @@ def choose(hw: hardware.HardwareInfo, forced: str | None, skip_bench: bool) -> t
             say(f"  失敗：{r['error']}")
         else:
             say(f"  5 秒音訊解碼 {r['decode_5s']} 秒（上限 {DECODE_BUDGET[p.name]}），輸出：{r['text'][:40]}")
-            if skip_bench or forced or r["decode_5s"] <= DECODE_BUDGET[p.name]:
+            sim = r.get("similarity")
+            if (sim is not None and sim < MIN_SIMILARITY) or not r["text"].strip():
+                # 能跑但辨識結果是空的或亂碼（例如 GPU 編譯器出錯）：不能採用
+                say(f"  辨識結果不正確（相似度 {sim}），降一級")
+            elif skip_bench or forced or r["decode_5s"] <= DECODE_BUDGET[p.name]:
                 return p, log
-            say("  太慢，降一級")
+            else:
+                say("  太慢，降一級")
         nxt = profiles.downgrade(p)
         p = profiles.with_threads(nxt, hw) if nxt else None
     raise SystemExit("所有等級都無法使用，請查看上方錯誤訊息")
@@ -142,26 +173,25 @@ def create_shortcuts(project: Path) -> list[str]:
     if not pyw.exists():
         return []
     made = []
-    ps_tmpl = (
-        "$w=New-Object -ComObject WScript.Shell;$l=$w.CreateShortcut('{lnk}');"
-        "$l.TargetPath='{target}';$l.Arguments='-m livesub';$l.WorkingDirectory='{cwd}';"
-        "$l.Description='即時字幕';$l.Save()"
+    # 桌面用 Known Folder 取得（OneDrive 備份會把桌面搬到 OneDrive\桌面）；路徑都用環境變數傳，避免引號問題
+    ps = (
+        "$d=[Environment]::GetFolderPath($env:LS_FOLDER);if(-not $d){exit 3};"
+        "$p=Join-Path $d '即時字幕.lnk';$w=New-Object -ComObject WScript.Shell;$l=$w.CreateShortcut($p);"
+        "$l.TargetPath=$env:LS_TARGET;$l.Arguments='-m livesub';$l.WorkingDirectory=$env:LS_CWD;"
+        "$l.Description='即時字幕';$l.Save();Write-Output $p"
     )
-    desktop = Path(os.environ.get("USERPROFILE", "~")) / "Desktop"
-    start_menu = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-    for folder in (desktop, start_menu):
-        if not folder.is_dir():
-            continue
-        lnk = folder / "即時字幕.lnk"
-        cmd = ps_tmpl.format(lnk=str(lnk).replace("'", "''"), target=str(pyw).replace("'", "''"),
-                             cwd=str(project).replace("'", "''"))
+    for folder in ("Desktop", "Programs"):
+        env = {**os.environ, "LS_FOLDER": folder, "LS_TARGET": str(pyw), "LS_CWD": str(project)}
         try:
-            subprocess.run(["powershell", "-NoProfile", "-Command", cmd], timeout=30, capture_output=True,
-                           creationflags=0x08000000)
-            if lnk.exists():
-                made.append(str(lnk))
-        except (OSError, subprocess.SubprocessError):
-            pass
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=30, capture_output=True,
+                               creationflags=0x08000000, env=env)
+            lnk = r.stdout.decode("utf-8", "replace").strip().splitlines()
+            if r.returncode == 0 and lnk and Path(lnk[-1]).exists():
+                made.append(lnk[-1])
+            else:
+                say(f"建立{folder}捷徑失敗：{r.stderr.decode('utf-8', 'replace')[:200]}")
+        except (OSError, subprocess.SubprocessError) as e:
+            say(f"建立{folder}捷徑失敗：{e}")
     return made
 
 
@@ -188,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
 
     s = config.load()
     s.runtime.profile = p.name
+    s.runtime.cpu_threads = p.cpu_threads  # 依真實實體核心數校正的值，執行期沿用
     config.save(s)
     info = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "hardware": hw.to_dict(), "profile": p.name,
             "probes": log, "translation": mt, "forced": args.profile}

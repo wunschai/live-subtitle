@@ -102,8 +102,16 @@ class LiveSubApp(QObject):
         if self.tray is not None:
             self.tray.set_running(st.running)
         if self._restart_pending and st.state in (PipelineState.IDLE, PipelineState.FAILED):
+            self._try_restart()
+
+    def _try_restart(self) -> None:
+        if not self._restart_pending:
+            return
+        self.pipeline.start()
+        if self.pipeline.state in (PipelineState.IDLE, PipelineState.FAILED):
+            QTimer.singleShot(500, self._try_restart)  # 舊推論還在收尾：保留 pending，稍後再試
+        else:
             self._restart_pending = False
-            self.pipeline.start()
 
     # ---- 控制 ----------------------------------------------------------
     def _make_source(self, s: Settings):

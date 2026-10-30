@@ -218,3 +218,10 @@ def test_panel_is_not_tool_window(panel):
     assert (
         panel.windowFlags() & Qt.WindowType.WindowType_Mask
     ) == Qt.WindowType.Window
+
+
+def test_status_shows_translation_latency_and_overflows(panel):
+    panel.set_status(PipelineStatus(state=PipelineState.RUNNING, profile_label="Intel 內顯",
+                                    latency_s=2.0, mt_latency_s=0.12, overflows=3))
+    text = panel.status_label.text() + panel.warning_label.text()
+    assert "延遲 2.0 秒" in text and "譯 +0.1 秒" in text and "掉音 3" in text

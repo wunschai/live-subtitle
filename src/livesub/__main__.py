@@ -20,6 +20,15 @@ def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    # pythonw 沒有 stderr：未接住的例外一律寫進 log，否則會無聲消失
+    import threading
+
+    def hook(exc_type, exc, tb):
+        logging.getLogger("livesub").critical("未處理的例外", exc_info=(exc_type, exc, tb))
+
+    sys.excepthook = hook
+    threading.excepthook = lambda a: hook(a.exc_type, a.exc_value, a.exc_traceback)
+
 
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
@@ -49,8 +58,10 @@ def main(argv: list[str] | None = None) -> int:
     settings = config.load(args.config)
     try:
         profile = profiles.resolve(settings.runtime, args.profile)
-    except KeyError as e:
-        print(e, file=sys.stderr)
+    except KeyError as e:  # 只會是命令列給錯（設定檔的錯名稱已在載入時改回自動偵測）
+        logging.getLogger("livesub").error("%s", e)
+        if sys.stderr is not None:
+            print(e, file=sys.stderr)
         return 2
 
     qapp = QApplication(sys.argv[:1])

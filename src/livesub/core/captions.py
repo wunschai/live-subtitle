@@ -64,8 +64,14 @@ class _Partial:
     lang: str
 
 
-def _joiner(lang: str) -> str:
-    return "" if lang == "zh" else " "
+_END_PUNCT = tuple("。！？；…，、」』）.!?;:,")
+
+
+def _joiner(lang: str, prev: str = "") -> str:
+    if lang != "zh":
+        return " "
+    # 中文句與句之間不加空白；但前一句沒有句尾標點時補全形空格，免得多句黏成一串
+    return "" if not prev or prev.rstrip().endswith(_END_PUNCT) else "　"
 
 
 class CaptionBoard:
@@ -99,11 +105,14 @@ class CaptionBoard:
         return True
 
     def cancel_partial(self, utt_id: int) -> None:
+        """這段不會有 final（雜音、合併或辨識失敗）：清掉它的 partial，之後也不再接受。
+
+        只記錄這一段，不推進 _max_final_utt——較舊的段落可能還在辨識中，不能被連帶封鎖。
+        """
         if self.partial and self.partial.utt_id == utt_id:
             self.partial = None
             self._touch()
         self._finalized_utts.add(utt_id)
-        self._max_final_utt = max(self._max_final_utt, utt_id)
 
     def add_final(self, utt_id: int, raw: str, text: str, lang: str) -> CaptionLine | None:
         """加入一句確認的字幕；text 為空表示這段被丟棄（只清掉 partial）。"""
@@ -111,8 +120,8 @@ class CaptionBoard:
             self.partial = None
         self._finalized_utts.add(utt_id)
         self._max_final_utt = max(self._max_final_utt, utt_id)
-        if len(self._finalized_utts) > 256:
-            self._finalized_utts = {u for u in self._finalized_utts if u > self._max_final_utt - 64}
+        if len(self._finalized_utts) > 256:  # 比 _max_final_utt 舊的已由比較式擋下，不必再記
+            self._finalized_utts = {u for u in self._finalized_utts if u > self._max_final_utt}
         if not text.strip():
             self._touch()
             return None
@@ -179,7 +188,7 @@ class CaptionBoard:
 
         def add(span: Span, lang: str) -> None:
             if spans:
-                spans.append(Span(_joiner(lang), dim=span.dim))
+                spans.append(Span(_joiner(lang, spans[-1].text), dim=span.dim))
             spans.append(span)
 
         for line in self.lines:

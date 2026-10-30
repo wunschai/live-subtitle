@@ -10,3 +10,4 @@ node_modules/
 *.partial/
 shots/
 kernel.errors.txt
+install.log

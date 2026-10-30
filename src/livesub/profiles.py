@@ -108,10 +108,14 @@ def resolve(runtime, cli_profile: str | None = None) -> Profile:
 
     name = cli_profile or runtime.profile_override or runtime.profile
     if name:
+        p = get(name)
+        threads = getattr(runtime, "cpu_threads", 0)
+        if threads:  # setup 依真實實體核心數校正過
+            return replace(p, cpu_threads=threads)
         logical = os.cpu_count() or 4
         hw = hardware.HardwareInfo(os="", arch="", cpu_name="", physical_cores=max(1, logical // 2),
                                    logical_cores=logical, ram_gb=0)
-        return with_threads(get(name), hw)
+        return with_threads(p, hw)
     hw = hardware.detect()
     return select_profile(hw, probe_openvino_gpu() if hw.intel_gpu else None)
 

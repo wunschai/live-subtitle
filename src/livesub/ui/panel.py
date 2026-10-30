@@ -317,12 +317,18 @@ class ControlPanel(QWidget):
         if status.profile_label:
             parts.append(status.profile_label)
         if status.latency_s is not None and math.isfinite(status.latency_s):
-            parts.append(f"延遲 {max(0.0, status.latency_s):.1f} 秒")
+            lat = f"延遲 {max(0.0, status.latency_s):.1f} 秒"
+            if status.mt_latency_s is not None and math.isfinite(status.mt_latency_s):
+                lat += f"（譯 +{max(0.0, status.mt_latency_s):.1f} 秒）"
+            parts.append(lat)
         if status.segmented:
             parts.append("分段字幕")
         self.status_label.setText(" · ".join(parts))
-        self.warning_label.setText(status.message)
-        self.warning_label.setVisible(bool(status.message))
+        warnings = [status.message] if status.message else []
+        if status.overflows > 0:
+            warnings.append(f"掉音 {status.overflows} 次（電腦太忙，可降低等級）")
+        self.warning_label.setText("；".join(warnings))
+        self.warning_label.setVisible(bool(warnings))
         level = status.level if math.isfinite(status.level) else 0.0
         with QSignalBlocker(self.level_bar):
             self.level_bar.setValue(round(max(0.0, min(1.0, level)) * 100))

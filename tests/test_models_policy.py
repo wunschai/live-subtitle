@@ -54,12 +54,42 @@ def test_resolve_requires_download():
         models.resolve("nope")
 
 
-def test_is_downloaded_checks_every_file():
-    d = models.local_dir("whisper-base")
+def _fake_install(key, content=b"x"):
+    import json
+
+    d = models.local_dir(key)
     d.mkdir(parents=True)
-    files = models.REGISTRY["whisper-base"].files
-    for f in files[:-1]:
-        (d / f).write_bytes(b"x")
-    assert not models.is_downloaded("whisper-base")
-    (d / files[-1]).write_bytes(b"x")
+    files = {}
+    for f in models.REGISTRY[key].files:
+        (d / f).write_bytes(content)
+        files[f] = {"size": len(content), "sha256": models._sha256(d / f)}
+    (d / models.MANIFEST).write_text(json.dumps({"revision": models.REGISTRY[key].revision, "files": files}))
+    return d
+
+
+def test_is_downloaded_requires_manifest_and_sizes():
+    d = _fake_install("whisper-base")
     assert models.is_downloaded("whisper-base")
+    (d / "model.bin").write_bytes(b"xx")  # 大小變了
+    assert not models.is_downloaded("whisper-base")
+
+
+def test_missing_file_not_downloaded():
+    d = _fake_install("whisper-base")
+    (d / "tokenizer.json").unlink()
+    assert not models.is_downloaded("whisper-base")
+
+
+def test_revision_change_invalidates(monkeypatch):
+    _fake_install("whisper-base")
+    m = models.REGISTRY["whisper-base"]
+    monkeypatch.setitem(models.REGISTRY, "whisper-base", dataclasses.replace(m, revision="b" * 40))
+    assert not models.is_downloaded("whisper-base")  # 新 revision → 新資料夾
+
+
+def test_verify_detects_same_size_corruption():
+    d = _fake_install("whisper-base", b"abc")
+    assert models.verify("whisper-base") == []
+    (d / "model.bin").write_bytes(b"abd")  # 大小相同、內容損毀
+    assert models.is_downloaded("whisper-base")  # 快速檢查抓不到
+    assert models.verify("whisper-base") == ["model.bin"]  # 完整檢查抓得到

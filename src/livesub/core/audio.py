@@ -124,6 +124,7 @@ class MicSource(AudioSource):
         self._resampler: Resampler | None = None
         self.overflows = 0
         self.level = 0.0
+        self._last_data = time.monotonic()
 
     def _resolve_device(self):
         if not self.device_name:
@@ -157,12 +158,20 @@ class MicSource(AudioSource):
         self._stream = sd.InputStream(device=idx, channels=1, samplerate=rate, dtype="float32",
                                       blocksize=int(rate * self.block_ms / 1000), callback=callback)
         self._stream.start()
+        self._last_data = time.monotonic()
+
+    STALL_S = 3.0  # 這麼久沒有任何音訊區塊就檢查串流是否還活著
 
     def read(self, timeout: float = 0.2) -> np.ndarray | None:
         try:
             raw = self._q.get(timeout=timeout)
         except queue.Empty:
+            if self._stream is not None and time.monotonic() - self._last_data > self.STALL_S:
+                if not self._stream.active:  # 裝置被拔掉或驅動停了：callback 不會再來
+                    raise OSError("麥克風串流已中斷（裝置被拔除？）")
+                self._last_data = time.monotonic()
             return None
+        self._last_data = time.monotonic()
         out = self._resampler.process(raw) if self._resampler else raw
         if out.size:
             self.level = float(min(1.0, np.sqrt(np.mean(out ** 2)) * 6))

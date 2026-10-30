@@ -132,3 +132,11 @@ def test_voiced_ratio_low_for_mostly_silence():
     probs = [0.9] * 4 + ([0.2] * 8 + [0.6] * 2) * 6 + [0.0] * secs(2.5)
     ev = run(seg, probs)
     assert ev and ev[-1].voiced_ratio < 0.5
+
+
+def test_short_clean_word_has_high_voiced_ratio():
+    """回歸：pre-roll 與句尾 pad 不能把 0.3 秒的乾淨短句壓到 0.4 以下（會被當成低信心丟掉）。"""
+    seg = Segmenter()
+    ev = run(seg, [0.0] * 20 + [0.9] * secs(0.3) + [0.0] * secs(1))
+    assert [e.kind for e in ev] == ["final"]
+    assert ev[0].voiced_ratio > 0.8

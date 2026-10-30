@@ -146,3 +146,12 @@ def test_revision_increases():
 ])
 def test_composition(text, comp):
     assert composition(text) == comp
+
+
+def test_unpunctuated_chinese_lines_get_separator():
+    """回歸：沒有句尾標點的中文 final 不能黏成一串。"""
+    b = CaptionBoard()
+    b.add_final(1, "r", "大家好", "zh")
+    b.add_final(2, "r", "今天介紹資料庫。", "zh")
+    b.add_final(3, "r", "第三句", "zh")
+    assert b.snapshot("zh").blocks[0].text == "大家好　今天介紹資料庫。第三句"

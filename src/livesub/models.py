@@ -79,11 +79,21 @@ REGISTRY: dict[str, ModelSpec] = {m.key: m for m in [
               "CC-BY-4.0", "quickmt（Mark Franey，加拿大）", "自行訓練", "quickmt", 410, _QUICKMT, "需標示出處"),
 ]}
 
-# 選用的 Ollama LLM 翻譯模型（只允許這些前綴）
-OLLAMA_ALLOWLIST = (
-    "gemma3", "gemma3n", "gemma4", "llama3.1", "llama3.2", "phi4-mini", "phi4",
-    "mistral", "ministral", "ycchen/breeze-7b-instruct", "jcai/breeze-7b-instruct",
-)
+# 選用的 Ollama LLM 翻譯：只接受「權重層 sha256」在下表中的模型。
+# 名稱可以被本機 `ollama cp` 任意改，權重 digest 才是內容本身；digest 取自 registry.ollama.ai 的
+# manifest（application/vnd.ollama.image.model 層），2026-10-30 抓取。
+OLLAMA_WEIGHT_DIGESTS = {
+    "2f8c3d137f2496dcb4019e17a50f2974b89c1be1a742db3c80cc86f91cafeeef": "gemma3:1b",
+    "f06e91e18fc74295d0c781bf91622508c75655e2c18ed869d52447ffe1e667e1": "gemma3:4b",
+    "13576eb6dd8d9d04b4da04d015ff343968628d3c2984195569d9d3585651d4f1": "gemma3:12b",
+    "d6138de197b83fafa8ced29005f4b12c47cc4adfca8fbcdf3e4e523774d023bc": "gemma3n:e2b",
+    "4e3c80c945d2db3ad542bc133e0465cb59332aa9b7e6376e38ab25782559a599": "gemma3n:e4b",
+    "3c168af1dea0a414299c7d9077e100ac763370e5a98b3c53801a958a47f0a5db": "phi4-mini",
+    "dde5aa3fc5ffc17176b5e8bdc82f587b24b2678c6c66101bf7da77af9f7ccdff": "llama3.2:3b",
+    "667b0c1932bc6ffc593ed1d03f895bf2dc8dc6df21db3042284a6f4416b06a29": "llama3.1:8b",
+    "8e17af7e8a471e086f2c78ca99098016eb331049ec266de4df87b5db9bce6989": "ycchen/breeze-7b-instruct-v1_0",
+}
+OLLAMA_ALLOWLIST = tuple(sorted({v.split(":")[0] for v in OLLAMA_WEIGHT_DIGESTS.values()}))
 
 
 def is_forbidden(name: str) -> bool:
@@ -92,10 +102,17 @@ def is_forbidden(name: str) -> bool:
 
 
 def ollama_model_allowed(name: str) -> bool:
+    """名稱初篩（設定檔驗證用）；真正放行要再通過 ollama_weights_allowed()。"""
     n = name.lower().strip()
     if is_forbidden(n):
         return False
-    return any(n == p or n.startswith((p + ":", p + "-", p + "_")) for p in OLLAMA_ALLOWLIST)
+    return any(n == p or n.startswith(p + ":") for p in OLLAMA_ALLOWLIST)
+
+
+def ollama_weights_allowed(modelfile: str) -> str | None:
+    """從 /api/show 的 modelfile（FROM …/blobs/sha256-<digest>）取出權重 digest，在清單內就回傳對應名稱。"""
+    m = re.search(r"^FROM\s+.*?sha256[-:]([0-9a-f]{64})", modelfile, re.M)
+    return OLLAMA_WEIGHT_DIGESTS.get(m.group(1)) if m else None
 
 
 def check_policy() -> list[str]:
@@ -111,22 +128,80 @@ def check_policy() -> list[str]:
     return bad
 
 
+MANIFEST = ".manifest.json"
+
+
 def local_dir(key: str) -> Path:
+    """每個 revision 一個資料夾：registry 換 revision 後舊權重不會被誤用。"""
     spec = REGISTRY[key]
-    return paths.models_dir() / spec.repo.replace("/", "--")
+    return paths.models_dir() / f"{spec.repo.replace('/', '--')}@{spec.revision[:12]}"
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_manifest(d: Path) -> dict | None:
+    import json
+
+    try:
+        return json.loads((d / MANIFEST).read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def is_downloaded(key: str) -> bool:
+    """快速檢查（每次啟動都會跑）：manifest 的 revision 相符，且每個必要檔案存在、大小相符。"""
+    spec = REGISTRY[key]
     d = local_dir(key)
-    return d.is_dir() and all((d / f).is_file() and (d / f).stat().st_size > 0 for f in REGISTRY[key].files)
+    m = _read_manifest(d)
+    if not m or m.get("revision") != spec.revision:
+        return False
+    files = m.get("files", {})
+    for f in spec.files:
+        p = d / f
+        if f not in files or not p.is_file() or p.stat().st_size != files[f]["size"]:
+            return False
+    return True
 
 
-def download(key: str, progress=None) -> Path:
-    """下載固定 revision 的必要檔案到暫存資料夾，驗證齊全後才換上（之後以本機路徑載入，可離線）。"""
+def verify(key: str) -> list[str]:
+    """完整檢查（setup 時跑）：重算 sha256 與 manifest 比對，回傳損壞的檔名。"""
+    d = local_dir(key)
+    m = _read_manifest(d) or {}
+    files = m.get("files", {})
+    return [f for f in REGISTRY[key].files
+            if f not in files or not (d / f).is_file() or _sha256(d / f) != files[f]["sha256"]]
+
+
+def _remote_lfs_hashes(spec: ModelSpec) -> dict[str, str]:
+    """Hugging Face 對該 revision 公布的 LFS 檔案 sha256（大檔都是 LFS）。"""
+    from huggingface_hub import HfApi
+
+    info = HfApi().model_info(spec.repo, revision=spec.revision, files_metadata=True)
+    out = {}
+    for sib in info.siblings or []:
+        lfs = getattr(sib, "lfs", None)
+        sha = getattr(lfs, "sha256", None) if lfs is not None else None
+        if sha:
+            out[sib.rfilename] = sha
+    return out
+
+
+def download(key: str, progress=None, force: bool = False) -> Path:
+    """下載固定 revision 的必要檔案到暫存資料夾；比對官方 sha256、寫入 manifest 後才換上。"""
+    import json
+
     spec = REGISTRY[key]
     if check_policy():
         raise ValueError("模型 registry 不合規：" + "; ".join(check_policy()))
-    if is_downloaded(key):
+    if not force and is_downloaded(key):
         return local_dir(key)
     from huggingface_hub import snapshot_download
 
@@ -141,6 +216,16 @@ def download(key: str, progress=None) -> Path:
     missing = [f for f in spec.files if not (tmp / f).is_file()]
     if missing:
         raise RuntimeError(f"{spec.repo} 下載不完整，缺少：{', '.join(missing)}")
+    remote = _remote_lfs_hashes(spec)
+    files = {}
+    for f in spec.files:
+        sha = _sha256(tmp / f)
+        if f in remote and remote[f] != sha:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise RuntimeError(f"{spec.repo}/{f} 雜湊不符（下載損毀或遭竄改）")
+        files[f] = {"size": (tmp / f).stat().st_size, "sha256": sha}
+    (tmp / MANIFEST).write_text(json.dumps({"repo": spec.repo, "revision": spec.revision, "files": files},
+                                           indent=1), "utf-8")
     shutil.rmtree(tmp / ".cache", ignore_errors=True)
     if target.exists():
         shutil.rmtree(target)
@@ -152,6 +237,9 @@ def resolve(key: str) -> Path:
     """回傳已下載模型的本機路徑；沒下載就丟錯（執行期不偷偷連網）。"""
     if key not in REGISTRY:
         raise KeyError(f"未登錄的模型：{key}")
+    spec = REGISTRY[key]
+    if any(is_forbidden(x) for x in (spec.key, spec.repo, spec.origin, spec.base, spec.converter)):
+        raise ValueError(f"禁用的模型來源：{spec.repo}")
     if not is_downloaded(key):
-        raise FileNotFoundError(f"模型 {key} 尚未下載，請先執行 livesub-setup")
+        raise FileNotFoundError(f"模型 {key} 尚未下載或不完整，請重新執行 livesub-setup")
     return local_dir(key)

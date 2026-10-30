@@ -68,6 +68,27 @@ def add_cuda_dll_dirs() -> list[str]:
     return added
 
 
+_COMPUTE_FALLBACK = ("float16", "int8_float16", "int8", "int8_float32", "float32")
+
+
+def pick_compute_type(device: str, wanted: str) -> str:
+    """舊顯示卡（例如 Pascal）不支援 float16 / int8_float16：改用該裝置支援的最佳選項。"""
+    try:
+        import ctranslate2
+
+        supported = ctranslate2.get_supported_compute_types(device)
+    except Exception:
+        return wanted
+    if wanted in supported:
+        return wanted
+    start = _COMPUTE_FALLBACK.index(wanted) if wanted in _COMPUTE_FALLBACK else 0
+    for ct in _COMPUTE_FALLBACK[start:] + _COMPUTE_FALLBACK[:start]:
+        if ct in supported:
+            log.warning("%s 不支援 %s，改用 %s", device, wanted, ct)
+            return ct
+    return wanted
+
+
 def _restrict_lang(lang: str | None, probs: list[tuple[str, float]] | None) -> str | None:
     """只接受 zh / en；其他語言（ja、ko、yue…）改挑 zh/en 中機率較高者。"""
     if lang in ("zh", "en"):
@@ -87,6 +108,7 @@ class FasterWhisperEngine:
             add_cuda_dll_dirs()
         from faster_whisper import WhisperModel
 
+        compute_type = pick_compute_type(device, compute_type)
         self.name = f"faster-whisper:{Path(model_path).name}"
         self.beam_final = beam_final
         self.model = WhisperModel(str(model_path), device=device, compute_type=compute_type,
@@ -127,15 +149,23 @@ class OpenVINOWhisperEngine:
 
     def transcribe(self, audio, language=None, prompt=None, final=True) -> AsrResult:
         t = time.perf_counter()
+        audio = np.ascontiguousarray(audio, np.float32)
+        r = self._generate(audio, language, prompt)
+        detected = getattr(r, "language", None) or language
+        lang = _restrict_lang(detected, None)
+        if lang is None:  # 判成日文、韓文等：OpenVINO 沒有語言機率可比，預設以中文重跑
+            lang = "zh"
+            r = self._generate(audio, lang, prompt)
+        text = (r.texts[0] if r.texts else "").strip()
+        return AsrResult(text, lang, None, None, time.perf_counter() - t)
+
+    def _generate(self, audio, language, prompt):
         cfg = self.pipe.get_generation_config()
         cfg.task = "transcribe"
         cfg.return_timestamps = False
         cfg.language = f"<|{language}|>" if language else None
         cfg.initial_prompt = prompt or None
-        r = self.pipe.generate(np.ascontiguousarray(audio, np.float32), cfg)
-        text = (r.texts[0] if r.texts else "").strip()
-        lang = _restrict_lang(getattr(r, "language", None) or language, None) or language
-        return AsrResult(text, lang, None, None, time.perf_counter() - t)
+        return self.pipe.generate(audio, cfg)
 
 
 def build_asr(profile) -> ASREngine:

@@ -39,6 +39,11 @@ from .theme import (
 )
 
 
+def _flatten(text: str) -> str:
+    """換行改成 Unicode 行分隔字元，讓 QTextLayout 視為同一段落。"""
+    return text.replace("\r", " ").replace("\n", "\u2028")
+
+
 class OverlayWindow(QWidget):
     def __init__(self, settings: DisplaySettings):
         flags = (
@@ -59,6 +64,8 @@ class OverlayWindow(QWidget):
         self._screen: QScreen | None = None
         self._fallback_to_primary = False
         self._paths: list[tuple[QPainterPath, bool]] = []
+        self._layouts: list[QTextLayout] = []
+        self._visible_texts: list[str] = []  # 每個區塊實際畫出的文字（測試／除錯用）
         self._font = make_font(settings.font_family, settings.font_size)
 
         self.fade_animation = QPropertyAnimation(self, b"windowOpacity", self)
@@ -174,8 +181,53 @@ class OverlayWindow(QWidget):
         # PySide6 版本可能將輸入／輸出參數包成 tuple。
         return float(result[0] if isinstance(result, tuple) else result)
 
+    def _layout_spans(self, block_spans, available_width: int, line_height: int):
+        """把一串 Span 排版成多行。回傳 (UTF-16 編碼文字, [(起, 迄, dim)], layout, lines)。"""
+        # 開頭若是分隔用的空白 span，丟掉，避免第一行前面多一格空白
+        while block_spans and not block_spans[0].text.strip() and len(block_spans) > 1:
+            block_spans = block_spans[1:]
+        # Qt 的文字索引以 UTF-16 code unit 計算，不是 Python 字元數。
+        text = _flatten("".join(sp.text for sp in block_spans))
+        encoded = text.encode("utf-16-le")
+        spans: list[tuple[int, int, bool]] = []
+        formats: list[QTextLayout.FormatRange] = []
+        offset = 0
+        for span in block_spans:
+            length = len(_flatten(span.text).encode("utf-16-le")) // 2
+            spans.append((offset, offset + length, span.dim))
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(255, 255, 255, 153 if span.dim else 255))
+            item = QTextLayout.FormatRange()
+            item.start = offset
+            item.length = length
+            item.format = fmt
+            formats.append(item)
+            offset += length
+
+        layout = QTextLayout(text, self._font)
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        option.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        option.setTextDirection(Qt.LayoutDirection.LeftToRight)
+        layout.setTextOption(option)
+        layout.setFormats(formats)
+
+        lines = []
+        layout.beginLayout()
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(available_width)
+            line.setPosition(QPointF(0, len(lines) * line_height))
+            lines.append(line)
+        layout.endLayout()
+        return encoded, spans, layout, lines
+
     def _cache_paths(self) -> None:
         self._paths.clear()
+        self._layouts = []
+        self._visible_texts = []
         if self._snapshot.empty:
             return
 
@@ -189,44 +241,21 @@ class OverlayWindow(QWidget):
             if block_index >= self._block_count:
                 break
 
-            # Qt 的文字索引以 UTF-16 code unit 計算，不是 Python 字元數。
-            text = block.text.replace("\r", " ").replace("\n", "\u2028")
-            encoded = text.encode("utf-16-le")
-            spans: list[tuple[int, int, bool]] = []
-            formats: list[QTextLayout.FormatRange] = []
-            offset = 0
-            for span in block.spans:
-                length = len(span.text.encode("utf-16-le")) // 2
-                spans.append((offset, offset + length, span.dim))
-                fmt = QTextCharFormat()
-                fmt.setForeground(QColor(255, 255, 255, 153 if span.dim else 255))
-                item = QTextLayout.FormatRange()
-                item.start = offset
-                item.length = length
-                item.format = fmt
-                formats.append(item)
-                offset += length
-
-            layout = QTextLayout(text, self._font)
-            option = QTextOption()
-            option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
-            option.setAlignment(Qt.AlignmentFlag.AlignLeft)
-            option.setTextDirection(Qt.LayoutDirection.LeftToRight)
-            layout.setTextOption(option)
-            layout.setFormats(formats)
-
-            lines = []
-            layout.beginLayout()
-            while True:
-                line = layout.createLine()
-                if not line.isValid():
+            # 溢出時整句整句地丟掉最舊的內容，讓第一行從句首開始；
+            # 只有最新一句單獨就超過行數時，才退而保留它的尾端幾行。
+            content = [i for i, sp in enumerate(block.spans) if sp.text.strip()] or [0]
+            for first in content:
+                encoded, spans, layout, lines = self._layout_spans(
+                    block.spans[first:], available_width, line_height)
+                if len(lines) <= d.max_lines:
                     break
-                line.setLineWidth(available_width)
-                line.setPosition(QPointF(0, len(lines) * line_height))
-                lines.append(line)
-            layout.endLayout()
+            self._layouts.append(layout)  # QTextLine 依附於 layout，必須保持存活
 
             kept = lines[-d.max_lines:]
+            if kept:
+                a0 = kept[0].textStart()
+                a1 = kept[-1].textStart() + kept[-1].textLength()
+                self._visible_texts.append(encoded[a0 * 2:a1 * 2].decode("utf-16-le"))
             block_top = OVERLAY_PADDING + block_index * (
                 block_height + OVERLAY_BLOCK_GAP
             )

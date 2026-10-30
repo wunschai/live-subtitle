@@ -32,6 +32,9 @@ class CT2Translator:
 
         self.name = "quickmt"
         self.taiwan_phrases = taiwan_phrases
+        from .asr import pick_compute_type
+
+        compute_type = pick_compute_type(device, compute_type)
         self._m = {}
         for key, p in (("zh-en", Path(zh_en_path)), ("en-zh", Path(en_zh_path))):
             tr = ctranslate2.Translator(str(p), device=device, compute_type=compute_type,
@@ -54,6 +57,39 @@ class CT2Translator:
 _LANG_NAME = {"zh": "Traditional Chinese (Taiwan)", "en": "English"}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):  # 不跟隨轉址：資料只能留在本機
+        return None
+
+
+# 不經過系統代理、不跟隨轉址
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def is_loopback_url(url: str) -> bool:
+    import ipaddress
+    from urllib.parse import urlparse
+
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return False
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    if u.hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(u.hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _post_json(url: str, payload: dict, timeout: float) -> dict:
+    req = urllib.request.Request(url, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+    with _LOCAL_OPENER.open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 class OllamaTranslator:
     """本機 Ollama（選用）。只接受 allowlist 內的模型；逾時或失敗由呼叫端退回 CT2。"""
 
@@ -61,11 +97,18 @@ class OllamaTranslator:
                  taiwan_phrases: bool = True):
         if not models.ollama_model_allowed(model):
             raise ValueError(f"Ollama 模型不在允許清單：{model}")
+        if not is_loopback_url(url):
+            raise ValueError(f"Ollama 只能連本機（localhost / 127.0.0.1）：{url}")
         self.name = f"ollama:{model}"
         self.model = model
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.taiwan_phrases = taiwan_phrases
+        # 名稱可被改，驗證實際權重的 sha256
+        info = _post_json(self.url + "/api/show", {"model": model}, timeout=5)
+        verified = models.ollama_weights_allowed(info.get("modelfile", ""))
+        if verified is None:
+            raise ValueError(f"Ollama 模型「{model}」的權重不在已審查清單（可能是改名的其他模型）")
 
     def _prompt(self, text, src, tgt, context):
         sys_msg = (
@@ -78,13 +121,10 @@ class OllamaTranslator:
         return [{"role": "system", "content": sys_msg}, {"role": "user", "content": text}]
 
     def translate(self, text, src, tgt, context=None) -> str:
-        body = json.dumps({
+        data = _post_json(self.url + "/api/chat", {
             "model": self.model, "stream": False, "messages": self._prompt(text, src, tgt, context),
             "options": {"temperature": 0.1, "num_predict": 256},
-        }).encode()
-        req = urllib.request.Request(self.url + "/api/chat", body, {"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            data = json.loads(r.read().decode("utf-8"))
+        }, self.timeout)
         out = data.get("message", {}).get("content", "").strip().splitlines()
         out = out[0].strip() if out else ""
         if tgt == "zh":
@@ -94,8 +134,10 @@ class OllamaTranslator:
 
 def ollama_available(url: str = "http://127.0.0.1:11434", timeout: float = 1.0) -> list[str]:
     """回傳 Ollama 已安裝且在 allowlist 內的模型；Ollama 沒跑就回傳空清單。"""
+    if not is_loopback_url(url):
+        return []
     try:
-        with urllib.request.urlopen(url.rstrip("/") + "/api/tags", timeout=timeout) as r:
+        with _LOCAL_OPENER.open(url.rstrip("/") + "/api/tags", timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError):
         return []
@@ -134,6 +176,6 @@ def build_translator(profile, runtime, taiwan_phrases: bool = True) -> Translato
         try:
             return FallbackTranslator(OllamaTranslator(runtime.ollama_model, runtime.ollama_url,
                                                        taiwan_phrases=taiwan_phrases), ct2)
-        except ValueError as e:
+        except (ValueError, OSError) as e:  # 不合規、連不上、權重不符
             log.warning("%s；改用 quickmt", e)
     return ct2

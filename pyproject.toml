@@ -23,7 +23,8 @@ dependencies = [
 [project.optional-dependencies]
 cuda = [
     "nvidia-cublas-cu12; sys_platform != 'darwin'",
-    "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
+    # 與 ctranslate2 4.8.x wheel 內附的 cudnn64_9.dll（9.10）同版，避免 cuDNN 子程式庫版本不一致
+    "nvidia-cudnn-cu12>=9.10,<9.11; sys_platform != 'darwin'",
 ]
 intel = ["openvino-genai>=2025.3"]
 

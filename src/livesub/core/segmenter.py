@@ -60,6 +60,7 @@ class Segmenter:
         self._speaking = False
         self._silence = 0
         self._voiced = 0  # 本段實際語音幀數
+        self._lead = 0  # 段首 pre-roll 中「觸發前」的幀數（不算進語音覆蓋率）
         self._since_partial = 0
         self._utt = 0
         self._partials_sent = False
@@ -105,6 +106,7 @@ class Segmenter:
                 self._probs = [q for _, q in self._pre]
                 self._pre.clear()
                 self._voiced = self._run
+                self._lead = max(0, len(self._frames) - self._run)
                 self._silence = 0
                 self._run = 0
                 self._new_utt()
@@ -142,7 +144,7 @@ class Segmenter:
                 ev.append(SegEvent("cancel", self._utt))
         else:
             ev.append(SegEvent("final", self._utt, np.concatenate(frames),
-                               voiced_ratio=self._ratio(len(frames))))
+                               voiced_ratio=self._ratio(len(self._frames) - trailing)))
         self._speaking = False
         self._frames, self._probs = [], []
         self._silence = self._voiced = 0
@@ -150,7 +152,9 @@ class Segmenter:
         self._pre.clear()
 
     def _ratio(self, n_frames: int) -> float:
-        return min(1.0, self._voiced / n_frames) if n_frames else 0.0
+        """語音覆蓋率：只算 pre-roll 之後、句尾靜音之前的核心區段。"""
+        core = n_frames - self._lead
+        return min(1.0, self._voiced / core) if core > 0 else 0.0
 
     def _find_cut(self) -> int:
         """回傳切點（幀索引，切在該幀之前）。
@@ -189,6 +193,7 @@ class Segmenter:
         self._new_utt()
         self._frames, self._probs = list(tail), list(tail_probs)
         self._voiced = sum(1 for q in tail_probs if q >= c.end_threshold)
+        self._lead = 0
         self._silence = 0
         for q in reversed(tail_probs):
             if q < c.end_threshold:

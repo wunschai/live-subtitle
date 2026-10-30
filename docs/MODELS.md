@@ -38,9 +38,16 @@
 
 ## 選用：Ollama LLM 翻譯
 
-Ollama 的模型由使用者自行 `ollama pull`，tag 無法鎖定 digest。程式只接受下列前綴：
+Ollama 的模型名稱可以在本機被 `ollama cp` 任意改掉，所以程式不信任名稱，而是驗證**權重本身**。允許的模型都釘選了權重層（GGUF）的 sha256，見 `models.OLLAMA_WEIGHT_DIGESTS`，數值取自 registry.ollama.ai manifest 中的 `application/vnd.ollama.image.model` 層，2026-10-30 抓取。
 
-`gemma3`, `gemma3n`, `gemma4`（Google）、`llama3.1`, `llama3.2`（Meta）、`phi4`, `phi4-mini`（Microsoft）、`mistral`, `ministral`（Mistral AI）、`ycchen/breeze-7b-instruct`, `jcai/breeze-7b-instruct`（MediaTek Breeze-7B，基於 Mistral-7B）
+啟動時，程式讀取 `/api/show` 回傳的 modelfile（`FROM …/blobs/sha256-<digest>`），digest 不在清單內就拒用，改回 quickmt。另外，Ollama 只允許連到本機（localhost、127.0.0.1、::1），不經系統代理，也不跟隨轉址。
+
+| 允許的模型 | 開發者 |
+|---|---|
+| gemma3:1b / 4b / 12b、gemma3n:e2b / e4b | Google |
+| phi4-mini | Microsoft |
+| llama3.2:3b、llama3.1:8b | Meta |
+| ycchen/breeze-7b-instruct-v1_0 | MediaTek Breeze-7B，基於 Mistral-7B |
 
 ## 已評估並排除
 

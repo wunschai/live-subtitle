@@ -40,7 +40,6 @@ class DisplaySettings:
     style: str = "box"
     box_opacity: float = 0.6  # 0–1
     font_size: int = 36
-    secondary_scale: float = 0.8  # 雙語時第二行字級比例
     max_lines: int = 2  # 每種語言最多幾句
     width_pct: int = 80
     margin_px: int = 40
@@ -54,6 +53,7 @@ class DisplaySettings:
 class RuntimeSettings:
     profile: str = ""  # livesub-setup 選定的等級；空 = 執行時自動偵測
     profile_override: str = ""  # 使用者手動指定（優先於 profile）
+    cpu_threads: int = 0  # setup 依實體核心數寫入；0 = 自動
     translator: str = "ct2"
     ollama_model: str = "gemma3:4b"
     ollama_url: str = "http://127.0.0.1:11434"
@@ -78,7 +78,6 @@ class Settings:
             d.style = "box"
         d.box_opacity = _clamp(_num(d.box_opacity, 0.6), 0.0, 1.0)
         d.font_size = int(_clamp(_num(d.font_size, 36), FONT_MIN, FONT_MAX))
-        d.secondary_scale = _clamp(_num(d.secondary_scale, 0.8), 0.5, 1.5)
         d.max_lines = int(_clamp(_num(d.max_lines, 2), 1, 3))
         d.width_pct = int(_clamp(_num(d.width_pct, 80), 30, 100))
         d.margin_px = int(_clamp(_num(d.margin_px, 40), 0, 400))
@@ -86,6 +85,13 @@ class Settings:
         d.clear_after_s = _clamp(_num(d.clear_after_s, 6.0), 0.0, 120.0)
         if r.translator not in TRANSLATORS:
             r.translator = "ct2"
+        from .profiles import PROFILES
+
+        for f in ("profile", "profile_override"):
+            if getattr(r, f) and getattr(r, f) not in PROFILES:
+                log.error("設定檔的等級「%s」不存在，改為自動偵測", getattr(r, f))
+                setattr(r, f, "")
+        r.cpu_threads = int(_clamp(_num(r.cpu_threads, 0), 0, 64))
         return self
 
     def to_dict(self) -> dict:
