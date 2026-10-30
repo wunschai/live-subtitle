@@ -73,6 +73,12 @@ class LiveSubApp(QObject):
         self._save_timer.setInterval(500)
         self._save_timer.timeout.connect(self._save)
 
+        # 換麥克風後的重新開始：單一 timer，避免狀態事件與重試互相觸發
+        self._restart_timer = QTimer(self)
+        self._restart_timer.setSingleShot(True)
+        self._restart_timer.setInterval(500)
+        self._restart_timer.timeout.connect(self._try_restart)
+
         kw = {"source_factory": self._make_source, **(pipeline_kwargs or {})}  # 測試可注入假元件
         self.pipeline = Pipeline(settings, profile, self.bridge.snapshot.emit, self.bridge.status.emit, **kw)
         qapp.aboutToQuit.connect(self._shutdown)
@@ -101,17 +107,23 @@ class LiveSubApp(QObject):
         self.panel.set_status(st)
         if self.tray is not None:
             self.tray.set_running(st.running)
-        if self._restart_pending and st.state in (PipelineState.IDLE, PipelineState.FAILED):
+        if self._restart_pending and st.state in (PipelineState.IDLE, PipelineState.FAILED)                 and not self._restart_timer.isActive():
             self._try_restart()
 
     def _try_restart(self) -> None:
-        if not self._restart_pending:
+        if not self._restart_pending or self._quitting:
             return
         self.pipeline.start()
         if self.pipeline.state in (PipelineState.IDLE, PipelineState.FAILED):
-            QTimer.singleShot(500, self._try_restart)  # 舊推論還在收尾：保留 pending，稍後再試
+            # 舊推論還在收尾：保留 pending，稍後再試。start() 送出的狀態事件會在 timer 啟動後才到，
+            # 因此 _on_status 不會再立即重試。
+            self._restart_timer.start()
         else:
             self._restart_pending = False
+
+    def _cancel_restart(self) -> None:
+        self._restart_pending = False
+        self._restart_timer.stop()
 
     # ---- 控制 ----------------------------------------------------------
     def _make_source(self, s: Settings):
@@ -123,7 +135,7 @@ class LiveSubApp(QObject):
         self.pipeline.start()
 
     def stop(self) -> None:
-        self._restart_pending = False
+        self._cancel_restart()
         self.pipeline.stop()
 
     def start_stop(self) -> None:
@@ -164,6 +176,7 @@ class LiveSubApp(QObject):
         if self._quitting:
             return
         self._quitting = True
+        self._cancel_restart()
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._save()

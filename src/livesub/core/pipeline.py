@@ -111,7 +111,8 @@ class _Session:
         self.level = 0.0
         self.asr = None
         self.mt = None
-        self.source: AudioSource | None = None
+        self.mt_on_cpu = False
+        self.source: AudioSource | None = None  # loader 交付後才設定；之後由 stopper 負責關閉
         self.profile: Profile | None = None
         self.threads: list[threading.Thread] = []
         self.last_snapshot_key = None
@@ -125,6 +126,10 @@ class _Session:
             self.asr_cv.notify_all()
         with self.mt_cv:
             self.mt_cv.notify_all()
+
+
+def _cpu_mt(p: Profile) -> Profile:
+    return replace(p, mt_device="cpu", mt_compute_type="int8")
 
 
 def profile_chain(p: Profile) -> list[Profile]:
@@ -177,6 +182,7 @@ class Pipeline:
         self._next_sid = 0
         self._cur: _Session | None = None
         self._lingering: list[threading.Thread] = []  # 停止逾時仍未結束的舊執行緒
+        self._stopper: threading.Thread | None = None
         self._state = PipelineState.IDLE
         self._message = ""
         self._active_profile: Profile | None = None
@@ -246,16 +252,20 @@ class Pipeline:
             s = self._cur
             if s is None or (only is not None and s is not only):
                 return
-            if self._state in (PipelineState.IDLE, PipelineState.STOPPING) or \
+            if self._state == PipelineState.STOPPING:
+                t = self._stopper  # 已經在停：wait=True 時等既有的清理做完
+            elif self._state == PipelineState.IDLE or \
                     (self._state == PipelineState.FAILED and final_state == PipelineState.FAILED):
                 return
-            self._set_state(PipelineState.STOPPING, "")
-            s.stop.set()
+            else:
+                self._set_state(PipelineState.STOPPING, "")
+                s.stop.set()
+                t = threading.Thread(target=self._join, args=(s, final_state, message),
+                                     name="livesub-stopper", daemon=True)
+                self._stopper = t
+                t.start()  # 在鎖內啟動：其他呼叫者拿到時一定已經 start，可以 join
         s.wake()
-        t = threading.Thread(target=self._join, args=(s, final_state, message), name="livesub-stopper",
-                             daemon=True)
-        t.start()
-        if wait:
+        if wait and t is not None and t is not threading.current_thread():
             t.join(timeout=JOIN_TIMEOUT_S + 5)
 
     def _join(self, s: _Session, final_state: PipelineState, message: str) -> None:
@@ -289,46 +299,55 @@ class Pipeline:
 
     # ---- 載入 ----------------------------------------------------------
     def _load_and_run(self, s: _Session) -> None:
+        # 音訊來源在交付給工作階段（s.source）之前都歸 loader 管：取消或失敗時由這裡關閉。
+        # 交付與 stop 旗標都在 self._lock 內判斷，所以來源只會由 loader 或 stopper 其中一方關閉。
+        source, handed = None, False
         try:
             asr, prof, note = self._build_asr(s)
             if s.stop.is_set():
                 return
-            mt, mt_note = self._build_mt(prof)
+            mt, mt_note, mt_on_cpu = self._build_mt(prof)
             if mt_note:
                 note = (note + "；" if note else "") + mt_note
             vad = self._vad_factory()
             if s.stop.is_set():
                 return
             source = self._source_factory(self.settings)
-            s.source = source  # 先登記，停止時才關得到
             source.start()
-        except Exception as e:
-            log.exception("啟動失敗")
             with self._lock:
-                if self._cur is s and not s.stop.is_set():
-                    s.stop.set()
-                    self._set_state(PipelineState.FAILED, f"啟動失敗：{e}")
-            if s.source is not None:
-                s.source.stop()
-            return
+                if s.stop.is_set() or self._cur is not s:
+                    return
+                s.source, handed = source, True
+                self._start_workers(s, asr, mt, mt_on_cpu, prof, source, vad, note)
+        except Exception as e:
+            if not s.stop.is_set():
+                log.exception("啟動失敗")
+                # 走統一的停止流程：清理期間是 STOPPING，loader 逾時會列入 lingering
+                self._fail(s, f"啟動失敗：{e}")
+        finally:
+            if source is not None and not handed:
+                try:
+                    source.stop()
+                except Exception:
+                    log.exception("關閉音訊來源失敗")
 
-        with self._lock:
-            if s.stop.is_set() or self._cur is not s:
-                return  # stopper 會負責關 source
-            s.asr, s.mt, s.profile = asr, mt, prof
-            self._active_profile = prof
-            seg_cfg = SegmenterConfig(max_segment_s=prof.max_segment_s, partial_interval_s=prof.partial_interval_s)
-            workers = [
-                threading.Thread(target=self._capture_loop, args=(s, source, vad, seg_cfg),
-                                 name="livesub-capture", daemon=True),
-                threading.Thread(target=self._asr_loop, args=(s,), name="livesub-asr", daemon=True),
-                threading.Thread(target=self._mt_loop, args=(s,), name="livesub-mt", daemon=True),
-                threading.Thread(target=self._coord_loop, args=(s,), name="livesub-coord", daemon=True),
-            ]
-            s.threads += workers
-            for t in workers:
-                t.start()
-            self._set_state(PipelineState.RUNNING, note)
+    def _start_workers(self, s: _Session, asr, mt, mt_on_cpu: bool, prof: Profile, source: AudioSource,
+                       vad, note: str) -> None:
+        """呼叫端持有 self._lock。"""
+        s.asr, s.mt, s.mt_on_cpu, s.profile = asr, mt, mt_on_cpu, prof
+        self._active_profile = prof
+        seg_cfg = SegmenterConfig(max_segment_s=prof.max_segment_s, partial_interval_s=prof.partial_interval_s)
+        workers = [
+            threading.Thread(target=self._capture_loop, args=(s, source, vad, seg_cfg),
+                             name="livesub-capture", daemon=True),
+            threading.Thread(target=self._asr_loop, args=(s,), name="livesub-asr", daemon=True),
+            threading.Thread(target=self._mt_loop, args=(s,), name="livesub-mt", daemon=True),
+            threading.Thread(target=self._coord_loop, args=(s,), name="livesub-coord", daemon=True),
+        ]
+        s.threads += workers
+        for t in workers:
+            t.start()
+        self._set_state(PipelineState.RUNNING, note)
 
     def _build_asr(self, s: _Session):
         """沿 fallback 鏈逐級嘗試；必須「載入＋實際推論」都成功才採用。"""
@@ -351,16 +370,17 @@ class Pipeline:
         raise RuntimeError("沒有可用的辨識模型：" + "；".join(errors))
 
     def _build_mt(self, p: Profile):
+        """回傳 (翻譯器, 提示訊息, 是否已在 CPU 上)。"""
         try:
-            return self._mt_factory(p, self.settings), ""
+            return self._mt_factory(p, self.settings), "", p.mt_device == "cpu"
         except Exception as e:
             log.warning("翻譯器載入失敗（%s）：%s", p.mt_device, e)
             if p.mt_device != "cpu":  # 顯示卡上載不起來就改用 CPU
                 try:
-                    return self._mt_factory(replace(p, mt_device="cpu", mt_compute_type="int8"), self.settings), ""
+                    return self._mt_factory(_cpu_mt(p), self.settings), "", True
                 except Exception as e2:
                     e = e2
-            return None, f"翻譯器無法載入（{e}），只顯示原文"
+            return None, f"翻譯器無法載入（{e}），只顯示原文", True
 
     # ---- capture -------------------------------------------------------
     def _capture_loop(self, s: _Session, source: AudioSource, vad, seg_cfg) -> None:
@@ -442,8 +462,12 @@ class Pipeline:
             try:
                 res = self._run_asr(s, req)
             except Exception as e:
-                log.exception("辨識失敗")
                 s.stats["asr_errors"] += 1
+                if req.kind == "partial":
+                    # partial 失敗只是少一次預覽：不封鎖這段，也不計入失敗門檻，交給 final 處理
+                    log.warning("partial 辨識失敗：%s", e)
+                    continue
+                log.exception("辨識失敗")
                 s.asr_errors += 1
                 for u in req.merged_utts + [req.utt_id]:  # 清掉這段的 partial，避免永遠不淡出
                     s.events.put(_Cancel(u))
@@ -514,8 +538,23 @@ class Pipeline:
                 out = s.mt.translate(text, src, tgt, ctx) or None
             except Exception as e:
                 log.warning("翻譯失敗：%s", e)
-                out = None
+                out = self._retry_mt_on_cpu(s, text, src, tgt, ctx)
             s.events.put(_MtDone(line_id, tgt, out, queued))
+
+    def _retry_mt_on_cpu(self, s: _Session, text: str, src: str, tgt: str, ctx) -> str | None:
+        """顯示卡上的翻譯推論失敗（例如顯存不足）：改用 CPU 翻譯器並重試這一句。只換一次。"""
+        if s.mt_on_cpu or s.profile is None or s.stop.is_set():
+            return None
+        s.mt_on_cpu = True
+        try:
+            s.mt = self._mt_factory(_cpu_mt(s.profile), self.settings)
+            out = s.mt.translate(text, src, tgt, ctx) or None
+        except Exception as e:
+            log.warning("CPU 翻譯器也無法使用：%s", e)
+            return None
+        log.info("翻譯已改用 CPU")
+        s.events.put(("message", "翻譯改用 CPU（顯示卡翻譯失敗）"))
+        return out
 
     # ---- coordinator -----------------------------------------------------
     def _coord_loop(self, s: _Session) -> None:

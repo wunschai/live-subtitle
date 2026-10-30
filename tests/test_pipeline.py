@@ -428,3 +428,119 @@ def test_translator_falls_back_to_cpu():
     assert wait_for(lambda: rec.last and "[en]" in rec.last.blocks[1].text)
     assert wait_for(lambda: any(st.mt_latency_s is not None for st in rec.statuses))
     p.stop(wait=True)
+
+
+# ---- 最終審查（04）的回歸測試 ----------------------------------------------
+def _pipeline(source_factory, asr=None, mt_factory=None, profile="cpu-high"):
+    s = Settings()
+    s.display.clear_after_s = 0
+    rec = Recorder()
+    asr = asr or FakeASR()
+    p = Pipeline(s, profiles.get(profile), rec.snap, rec.status, source_factory=source_factory,
+                 asr_factory=lambda _p: asr, mt_factory=mt_factory or (lambda _p, _s: FakeMT()),
+                 vad_factory=FakeVAD, require_models=False)
+    return p, rec
+
+
+def test_loader_closes_source_opened_after_stop_timeout(monkeypatch):
+    """開麥克風卡住超過停止期限：loader 稍後開好來源時必須自己關掉，並在那之前擋住重啟。"""
+    import livesub.core.pipeline as P
+
+    monkeypatch.setattr(P, "JOIN_TIMEOUT_S", 0.3)
+    entered, gate = threading.Event(), threading.Event()
+    made = []
+
+    def slow_factory(_s):
+        entered.set()
+        gate.wait(10)
+        src = FakeSource(SPEECH)
+        made.append(src)
+        return src
+
+    p, rec = _pipeline(slow_factory)
+    p.start()
+    assert entered.wait(5)
+    p.stop(wait=True)
+    assert p.state == PipelineState.IDLE
+    p.start()
+    assert p.state == PipelineState.IDLE  # loader 還活著：拒絕重啟
+    gate.set()
+    assert wait_for(lambda: not any(t.is_alive() for t in p._lingering), timeout=5)
+    assert made and made[0].stopped
+
+
+def test_start_failure_goes_through_stopping_and_closes_source():
+    class BadStart(FakeSource):
+        def start(self):
+            raise OSError("裝置被占用")
+
+    src = BadStart(SPEECH)
+    p, rec = _pipeline(lambda _s: src)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.FAILED)
+    states = [st.state for st in rec.statuses]
+    assert PipelineState.STOPPING in states
+    assert states.index(PipelineState.STOPPING) < len(states) - 1
+    assert "啟動失敗" in rec.statuses[-1].message
+    assert src.stopped
+    assert not any(t.is_alive() for t in p._cur.threads)
+
+
+def test_stop_wait_while_already_stopping_waits_for_cleanup():
+    release = threading.Event()
+
+    class SlowStop(FakeSource):
+        def stop(self):
+            release.wait(5)
+            super().stop()
+
+    src = SlowStop(SPEECH, realtime_factor=1.0)
+    p, rec = _pipeline(lambda _s: src)
+    p.start()
+    assert wait_for(lambda: p.state == PipelineState.RUNNING)
+    p.stop()  # 使用者按停止
+    assert p.state == PipelineState.STOPPING
+    threading.Timer(0.3, release.set).start()
+    p.stop(wait=True)  # 接著結束程式：必須等清理做完
+    assert src.stopped
+    assert p.state == PipelineState.IDLE
+
+
+def test_translation_inference_failure_switches_to_cpu():
+    devices = []
+
+    class OomMT(FakeMT):
+        def translate(self, text, src, tgt, context=None):
+            raise RuntimeError("CUDA out of memory")
+
+    def mt_factory(prof, _s):
+        devices.append(prof.mt_device)
+        return OomMT() if prof.mt_device == "cuda" else FakeMT()
+
+    p, rec = _pipeline(lambda _s: FakeSource(SPEECH), mt_factory=mt_factory, profile="nvidia-mid")
+    p.start()
+    assert wait_for(lambda: rec.last and "[en]" in rec.last.blocks[1].text)
+    assert devices == ["cuda", "cpu"]
+    assert any("改用 CPU" in st.message for st in rec.statuses)
+    p.stop(wait=True)
+
+
+def test_partial_failures_do_not_block_segment_or_fail_pipeline():
+    class FlakyPartials(FakeASR):
+        def transcribe(self, audio, language=None, prompt=None, final=True):
+            if not final and len(audio) != SR:  # 暖機（1 秒靜音）可以過，其餘 partial 隔一次失敗
+                self.calls.append(("partial", len(audio), language, prompt))
+                if len(self.calls) % 2:
+                    raise RuntimeError("partial glitch")
+                return AsrResult("說話中", self.lang, -0.2, 0.01, 0.0)
+            return super().transcribe(audio, language, prompt, final)
+
+    asr = FlakyPartials()
+    pattern = [(0.3, False)] + [(2.5, True), (0.8, False)] * 4
+    p, rec = _pipeline(lambda _s: FakeSource(pattern, 1.0), asr=asr, profile="intel-gpu-lite")
+    p.start()
+    assert wait_for(lambda: asr.n >= 4, timeout=25)
+    assert p.state == PipelineState.RUNNING  # partial 一再失敗也不會讓整個工作失敗
+    assert p.stats["asr_errors"] > 0 and p.stats["partials"] > 0
+    assert p.board.lines and all("第" in l.original for l in p.board.lines)
+    p.stop(wait=True)
