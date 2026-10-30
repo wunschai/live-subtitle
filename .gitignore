@@ -6,3 +6,6 @@ venv/
 models/
 *.log
 node_modules/
+.pytest_cache/
+*.partial/
+shots/

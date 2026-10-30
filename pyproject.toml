@@ -1,0 +1,51 @@
+[project]
+name = "live-subtitle"
+version = "0.1.0"
+description = "演講／工作坊用的即時語音字幕與中英翻譯（桌面字幕列）"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "MIT" }
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "ctranslate2>=4.6,<5",
+    "sentencepiece>=0.2",
+    "onnxruntime>=1.17",
+    "sounddevice>=0.5",
+    "numpy>=1.26",
+    "PySide6-Essentials>=6.7",
+    "opencc-python-reimplemented>=0.1.7",
+    "huggingface_hub>=0.25",
+    "platformdirs>=4",
+    "tomli>=2; python_version < '3.11'",
+    "tomli-w>=1.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "nvidia-cublas-cu12; sys_platform != 'darwin'",
+    "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
+]
+intel = ["openvino-genai>=2025.3"]
+
+[project.scripts]
+livesub = "livesub.__main__:main"
+livesub-setup = "livesub.setup_cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-qt>=4.4", "pytest-timeout>=2.3"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/livesub"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: 需要真模型的整合測試（pytest -m slow）",
+    "gui: 需要 Qt 的測試",
+]
+addopts = "-m 'not slow'"
+timeout = 120

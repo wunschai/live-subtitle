@@ -1,0 +1,1289 @@
+=====FILE: src/livesub/ui/theme.py
+"""共用字型、色彩與面板樣式。"""
+
+from __future__ import annotations
+
+from PySide6.QtGui import QFont, QFontDatabase
+
+BACKGROUND = "#171c26"
+SURFACE = "#242c3b"
+FOREGROUND = "#f5f7fc"
+MUTED = "#a5afc2"
+ACCENT = "#70b7ff"
+WARNING = "#ffcb78"
+
+OVERLAY_PADDING = 12
+OVERLAY_BLOCK_GAP = 8
+OVERLAY_RADIUS = 12
+
+FONT_FAMILIES = (
+    "Microsoft JhengHei UI",
+    "Microsoft JhengHei",
+    "Noto Sans TC",
+    "PingFang TC",
+    "Segoe UI",
+)
+
+
+def make_font(family: str = "", pixel_size: int = 12) -> QFont:
+    font = QFont()
+    if family:
+        font.setFamily(family)
+    else:
+        available = set(QFontDatabase.families())
+        for candidate in FONT_FAMILIES:
+            if candidate in available:
+                font.setFamily(candidate)
+                break
+    font.setPixelSize(pixel_size)
+    return font
+
+
+PANEL_QSS = f"""
+QWidget {{
+    color: {FOREGROUND};
+}}
+QWidget#controlPanel {{
+    background: {BACKGROUND};
+}}
+QLabel {{
+    background: transparent;
+}}
+QLabel#statusLabel, QLabel#hotkeyLabel {{
+    color: {MUTED};
+}}
+QLabel#warningLabel {{
+    color: {WARNING};
+}}
+QPushButton, QToolButton, QComboBox, QSpinBox {{
+    background: {SURFACE};
+    border: 1px solid #354157;
+    border-radius: 6px;
+    padding: 4px 7px;
+}}
+QPushButton:hover, QToolButton:hover, QComboBox:hover {{
+    border-color: {ACCENT};
+}}
+QPushButton:pressed, QToolButton:pressed {{
+    background: #34465f;
+}}
+QPushButton:focus, QToolButton:focus, QComboBox:focus, QSpinBox:focus {{
+    border-color: {ACCENT};
+}}
+QPushButton:disabled, QComboBox:disabled, QSpinBox:disabled {{
+    color: #69758b;
+    background: #202633;
+}}
+QPushButton#startButton {{
+    background: #306da8;
+    border-color: #4788c5;
+    font-weight: bold;
+    padding: 7px;
+}}
+QPushButton#startButton:disabled {{
+    background: #2a3c50;
+    color: {MUTED};
+}}
+QComboBox QAbstractItemView {{
+    background: {SURFACE};
+    color: {FOREGROUND};
+    selection-background-color: #306da8;
+    border: 1px solid #354157;
+}}
+QSlider::groove:horizontal {{
+    height: 4px;
+    border-radius: 2px;
+    background: #354157;
+}}
+QSlider::sub-page:horizontal {{
+    background: {ACCENT};
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {FOREGROUND};
+    width: 12px;
+    margin: -4px 0;
+    border-radius: 6px;
+}}
+QSlider::sub-page:horizontal:disabled {{
+    background: #536078;
+}}
+QSlider::handle:horizontal:disabled {{
+    background: #69758b;
+}}
+QGroupBox {{
+    border: 1px solid #354157;
+    border-radius: 8px;
+    margin-top: 8px;
+    padding: 8px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+    color: {MUTED};
+}}
+QProgressBar {{
+    background: #283142;
+    border: none;
+    border-radius: 3px;
+    min-height: 6px;
+    max-height: 6px;
+}}
+QProgressBar::chunk {{
+    background: {ACCENT};
+    border-radius: 3px;
+}}
+QMenu {{
+    background: {BACKGROUND};
+    color: {FOREGROUND};
+    border: 1px solid #354157;
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 6px 18px;
+    border-radius: 4px;
+}}
+QMenu::item:selected {{
+    background: #306da8;
+}}
+QToolTip {{
+    background: {SURFACE};
+    color: {FOREGROUND};
+    border: 1px solid #354157;
+    padding: 5px;
+}}
+"""
+=====END
+
+=====FILE: src/livesub/ui/overlay.py
+"""不取得焦點、可穿透滑鼠的字幕視窗。"""
+
+from __future__ import annotations
+
+import copy
+
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    Qt,
+)
+from PySide6.QtGui import (
+    QColor,
+    QFontMetrics,
+    QGuiApplication,
+    QPaintEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QScreen,
+    QTextCharFormat,
+    QTextLayout,
+    QTextOption,
+)
+from PySide6.QtWidgets import QWidget
+
+from livesub.config import DisplaySettings
+from livesub.core.captions import BoardSnapshot, EMPTY_SNAPSHOT
+
+from .theme import (
+    OVERLAY_BLOCK_GAP,
+    OVERLAY_PADDING,
+    OVERLAY_RADIUS,
+    make_font,
+)
+
+
+class OverlayWindow(QWidget):
+    def __init__(self, settings: DisplaySettings):
+        flags = (
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self._settings = copy.deepcopy(settings)
+        self._snapshot = EMPTY_SNAPSHOT
+        self._block_count = 1
+        self._screen: QScreen | None = None
+        self._fallback_to_primary = False
+        self._paths: list[tuple[QPainterPath, bool]] = []
+        self._font = make_font(settings.font_family, settings.font_size)
+
+        self.fade_animation = QPropertyAnimation(self, b"windowOpacity", self)
+        self.fade_animation.setDuration(300)
+        self.fade_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._opacity_target = 0.0
+        self.setWindowOpacity(0.0)
+
+        app = QGuiApplication.instance()
+        if app is None:
+            raise RuntimeError("建立字幕視窗前必須先建立 QApplication")
+        app.screenAdded.connect(self._screens_changed)
+        app.screenRemoved.connect(self._screen_removed)
+        app.primaryScreenChanged.connect(self._screens_changed)
+        self.apply_settings(settings)
+
+    def apply_settings(self, settings: DisplaySettings) -> None:
+        if settings.screen != self._settings.screen:
+            self._fallback_to_primary = False
+        self._settings = copy.deepcopy(settings)
+        self._font = make_font(settings.font_family, settings.font_size)
+        self.setFont(self._font)
+        self._refresh()
+
+    def set_block_count(self, count: int) -> None:
+        """收到新模式的快照之前，可先預留對應高度。"""
+        count = max(1, int(count))
+        if count != self._block_count:
+            self._block_count = count
+            self._refresh()
+
+    def _choose_screen(self) -> QScreen | None:
+        screens = QGuiApplication.screens()
+        index = self._settings.screen
+        if not self._fallback_to_primary and 0 <= index < len(screens):
+            return screens[index]
+        return QGuiApplication.primaryScreen()
+
+    def _bind_screen(self) -> None:
+        screen = self._choose_screen()
+        if screen is self._screen:
+            return
+        if self._screen is not None:
+            try:
+                self._screen.geometryChanged.disconnect(self._geometry_changed)
+            except (RuntimeError, TypeError):
+                pass
+        self._screen = screen
+        if screen is not None:
+            screen.geometryChanged.connect(self._geometry_changed)
+
+    def _screens_changed(self, *_: object) -> None:
+        self._refresh()
+
+    def _screen_removed(self, screen: QScreen) -> None:
+        if screen is self._screen:
+            self._fallback_to_primary = True
+        self._refresh()
+
+    def _geometry_changed(self, _: QRect) -> None:
+        self._refresh()
+
+    def target_geometry(self) -> QRect:
+        screen = self._choose_screen()
+        geo = screen.geometry() if screen is not None else QRect(0, 0, 800, 600)
+        d = self._settings
+        width = max(1, round(geo.width() * d.width_pct / 100))
+        line_height = QFontMetrics(self._font).lineSpacing()
+        height = (
+            self._block_count * d.max_lines * line_height
+            + (self._block_count - 1) * OVERLAY_BLOCK_GAP
+            + 2 * OVERLAY_PADDING
+        )
+        x = geo.left() + (geo.width() - width) // 2
+        if d.position == "top":
+            y = geo.top() + d.margin_px
+        else:
+            # 依介面契約使用 QRect.bottom() 的含尾端座標。
+            y = geo.bottom() - d.margin_px - height
+        return QRect(x, y, width, max(1, height))
+
+    def _refresh(self) -> None:
+        self._bind_screen()
+        geometry = self.target_geometry()
+        if self.geometry() != geometry:
+            self.setGeometry(geometry)
+        self._cache_paths()
+        self.update()
+
+    def show_snapshot(self, snap: BoardSnapshot) -> None:
+        self._snapshot = snap
+        if snap.blocks:
+            self._block_count = len(snap.blocks)
+        self._refresh()
+        self._animate_opacity(1.0 if snap.visible and not snap.empty else 0.0)
+
+    def _animate_opacity(self, target: float) -> None:
+        if target == self._opacity_target:
+            return
+        self._opacity_target = target
+        self.fade_animation.stop()
+        current = self.windowOpacity()
+        if abs(current - target) < 0.001:
+            self.setWindowOpacity(target)
+            return
+        self.fade_animation.setStartValue(current)
+        self.fade_animation.setEndValue(target)
+        self.fade_animation.start()
+
+    @staticmethod
+    def _cursor_x(line: object, position: int) -> float:
+        result = line.cursorToX(position)
+        # PySide6 版本可能將輸入／輸出參數包成 tuple。
+        return float(result[0] if isinstance(result, tuple) else result)
+
+    def _cache_paths(self) -> None:
+        self._paths.clear()
+        if self._snapshot.empty:
+            return
+
+        d = self._settings
+        metrics = QFontMetrics(self._font)
+        line_height = metrics.lineSpacing()
+        block_height = d.max_lines * line_height
+        available_width = max(1, self.width() - 2 * OVERLAY_PADDING)
+
+        for block_index, block in enumerate(self._snapshot.blocks):
+            if block_index >= self._block_count:
+                break
+
+            # Qt 的文字索引以 UTF-16 code unit 計算，不是 Python 字元數。
+            text = block.text.replace("\r", " ").replace("\n", "\u2028")
+            encoded = text.encode("utf-16-le")
+            spans: list[tuple[int, int, bool]] = []
+            formats: list[QTextLayout.FormatRange] = []
+            offset = 0
+            for span in block.spans:
+                length = len(span.text.encode("utf-16-le")) // 2
+                spans.append((offset, offset + length, span.dim))
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor(255, 255, 255, 153 if span.dim else 255))
+                item = QTextLayout.FormatRange()
+                item.start = offset
+                item.length = length
+                item.format = fmt
+                formats.append(item)
+                offset += length
+
+            layout = QTextLayout(text, self._font)
+            option = QTextOption()
+            option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+            option.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            option.setTextDirection(Qt.LayoutDirection.LeftToRight)
+            layout.setTextOption(option)
+            layout.setFormats(formats)
+
+            lines = []
+            layout.beginLayout()
+            while True:
+                line = layout.createLine()
+                if not line.isValid():
+                    break
+                line.setLineWidth(available_width)
+                line.setPosition(QPointF(0, len(lines) * line_height))
+                lines.append(line)
+            layout.endLayout()
+
+            kept = lines[-d.max_lines:]
+            block_top = OVERLAY_PADDING + block_index * (
+                block_height + OVERLAY_BLOCK_GAP
+            )
+            for row, line in enumerate(kept):
+                start = line.textStart()
+                end = start + line.textLength()
+                left = OVERLAY_PADDING + (
+                    available_width - line.naturalTextWidth()
+                ) / 2
+                baseline = block_top + row * line_height + metrics.ascent()
+
+                for span_start, span_end, dim in spans:
+                    a, b = max(start, span_start), min(end, span_end)
+                    if a >= b:
+                        continue
+                    fragment = encoded[a * 2:b * 2].decode("utf-16-le")
+                    fragment = fragment.replace("\u2028", "")
+                    if not fragment:
+                        continue
+                    path = QPainterPath()
+                    path.addText(
+                        QPointF(left + self._cursor_x(line, a), baseline),
+                        self._font,
+                        fragment,
+                    )
+                    self._paths.append((path, dim))
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        if self._snapshot.empty:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        d = self._settings
+
+        if d.style == "box":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(
+                QColor(0, 0, 0, round(255 * max(0.0, min(1.0, d.box_opacity))))
+            )
+            painter.drawRoundedRect(
+                QRectF(self.rect()), OVERLAY_RADIUS, OVERLAY_RADIUS
+            )
+
+        stroke_width = (
+            max(1.0, d.font_size / 9)
+            if d.style == "outline"
+            else max(1.0, d.font_size / 24)
+        )
+        pen = QPen(QColor(0, 0, 0, 235))
+        pen.setWidthF(stroke_width)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+        for path, dim in self._paths:
+            painter.save()
+            painter.setOpacity(0.6 if dim else 1.0)
+            if d.style == "outline":
+                painter.save()
+                painter.translate(1.5, 2.0)
+                painter.fillPath(path, QColor(0, 0, 0, 105))
+                painter.restore()
+            painter.strokePath(path, pen)
+            painter.fillPath(path, QColor("white"))
+            painter.restore()
+        painter.end()
+=====END
+
+=====FILE: src/livesub/ui/panel.py
+"""繁體中文控制面板。"""
+
+from __future__ import annotations
+
+import copy
+import math
+
+from PySide6.QtCore import QSignalBlocker, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QGuiApplication
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from livesub.config import Settings
+from livesub.core.status import PipelineState, PipelineStatus, STATE_LABELS
+
+from .theme import PANEL_QSS, make_font
+
+
+class ControlPanel(QWidget):
+    settingsChanged = Signal(object)
+    startRequested = Signal()
+    stopRequested = Signal()
+    hideRequested = Signal()
+    quitRequested = Signal()
+
+    def __init__(self, settings: Settings, can_hide: bool = True):
+        super().__init__(None, Qt.WindowType.WindowStaysOnTopHint)
+        self.setObjectName("controlPanel")
+        self.setWindowTitle("即時字幕")
+        self.setFont(make_font(settings.display.font_family, 12))
+        self.setStyleSheet(PANEL_QSS)
+        self.setMinimumWidth(320)
+        self._settings = copy.deepcopy(settings)
+        self._status = PipelineStatus()
+        self.can_hide = can_hide
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(5)
+
+        self.start_button = QPushButton("開始")
+        self.start_button.setObjectName("startButton")
+        self.start_button.setMinimumHeight(34)
+        self.start_button.clicked.connect(self._start_stop)
+        root.addWidget(self.start_button)
+
+        self.status_label = QLabel()
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setWordWrap(True)
+        root.addWidget(self.status_label)
+
+        self.warning_label = QLabel()
+        self.warning_label.setObjectName("warningLabel")
+        self.warning_label.setWordWrap(True)
+        root.addWidget(self.warning_label)
+
+        self.hotkey_label = QLabel()
+        self.hotkey_label.setObjectName("hotkeyLabel")
+        self.hotkey_label.setFont(make_font(settings.display.font_family, 10))
+        self.hotkey_label.setWordWrap(True)
+        root.addWidget(self.hotkey_label)
+
+        main_form = QFormLayout()
+        main_form.setSpacing(5)
+        main_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        root.addLayout(main_form)
+
+        self.mode_combo = self._combo(
+            [("原文", "original"), ("中文", "zh"),
+             ("英文", "en"), ("中英雙語", "bilingual")],
+            settings.display.mode,
+        )
+        self.position_combo = self._combo(
+            [("上方", "top"), ("下方", "bottom")],
+            settings.display.position,
+        )
+        self.font_slider, self.font_value, font_row = self._slider(
+            16, 96, settings.display.font_size, " px"
+        )
+        main_form.addRow("顯示模式", self.mode_combo)
+        main_form.addRow("位置", self.position_combo)
+        main_form.addRow("字級", font_row)
+
+        footer = QHBoxLayout()
+        self.advanced_button = QToolButton()
+        self.advanced_button.setText("進階")
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.setArrowType(Qt.ArrowType.RightArrow)
+        self.advanced_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        footer.addWidget(self.advanced_button)
+        footer.addStretch()
+        self.hide_button = QPushButton("隱藏面板")
+        self.hide_button.setEnabled(can_hide)
+        if not can_hide:
+            self.hide_button.setToolTip("系統匣與熱鍵都不可用，無法隱藏")
+        self.hide_button.clicked.connect(self._hide_panel)
+        footer.addWidget(self.hide_button)
+        root.addLayout(footer)
+
+        self.advanced_group = QGroupBox("進階設定")
+        advanced_form = QFormLayout(self.advanced_group)
+        advanced_form.setSpacing(6)
+        advanced_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        root.addWidget(self.advanced_group)
+
+        self.device_combo = self._combo([("系統預設", "")], "")
+        self.level_bar = QProgressBar()
+        self.level_bar.setRange(0, 100)
+        self.level_bar.setTextVisible(False)
+        self.level_bar.setAccessibleName("麥克風音量")
+
+        self.source_combo = self._combo(
+            [("自動", "auto"), ("中文", "zh"), ("英文", "en")],
+            settings.audio.source_language,
+        )
+        self.style_combo = self._combo(
+            [("直接顯示（描邊）", "outline"), ("半透明底框", "box")],
+            settings.display.style,
+        )
+        self.opacity_slider, self.opacity_value, opacity_row = self._slider(
+            0, 100, round(settings.display.box_opacity * 100), "%"
+        )
+        self.lines_spin = QSpinBox()
+        self.lines_spin.setRange(1, 3)
+        with QSignalBlocker(self.lines_spin):
+            self.lines_spin.setValue(settings.display.max_lines)
+        self.width_slider, self.width_value, width_row = self._slider(
+            30, 100, settings.display.width_pct, "%"
+        )
+        self.screen_combo = QComboBox()
+        self.screen_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.screen_combo.setMinimumContentsLength(12)
+        self.screen_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+
+        advanced_form.addRow("麥克風", self.device_combo)
+        advanced_form.addRow("音量", self.level_bar)
+        advanced_form.addRow("來源語言", self.source_combo)
+        advanced_form.addRow("樣式", self.style_combo)
+        advanced_form.addRow("底框不透明度", opacity_row)
+        advanced_form.addRow("每區行數", self.lines_spin)
+        advanced_form.addRow("字幕寬度", width_row)
+        advanced_form.addRow("螢幕", self.screen_combo)
+
+        for control, section, field in (
+            (self.mode_combo, "display", "mode"),
+            (self.position_combo, "display", "position"),
+            (self.device_combo, "audio", "device"),
+            (self.source_combo, "audio", "source_language"),
+            (self.style_combo, "display", "style"),
+            (self.screen_combo, "display", "screen"),
+        ):
+            control.currentIndexChanged.connect(
+                lambda _index, c=control, s=section, f=field:
+                self._combo_changed(c, s, f)
+            )
+
+        self.font_slider.valueChanged.connect(
+            lambda value: self._change("display", "font_size", value)
+        )
+        self.opacity_slider.valueChanged.connect(
+            lambda value: self._change("display", "box_opacity", value / 100)
+        )
+        self.lines_spin.valueChanged.connect(
+            lambda value: self._change("display", "max_lines", value)
+        )
+        self.width_slider.valueChanged.connect(
+            lambda value: self._change("display", "width_pct", value)
+        )
+        self.advanced_button.toggled.connect(self._set_advanced)
+        self.advanced_group.hide()
+
+        app = QGuiApplication.instance()
+        if app is not None:
+            app.screenAdded.connect(self._refresh_screens)
+            app.screenRemoved.connect(self._refresh_screens)
+        self._watched_screens = []
+        self._refresh_screens()
+        self.set_devices([], settings.audio.device)
+        self._update_opacity_enabled()
+        self.set_hotkey_ok(True)
+        self.set_status(self._status)
+        self.resize(320, 260)
+
+    @staticmethod
+    def _combo(items: list[tuple[str, object]], current: object) -> QComboBox:
+        combo = QComboBox()
+        with QSignalBlocker(combo):
+            for label, value in items:
+                combo.addItem(label, value)
+            index = combo.findData(current)
+            combo.setCurrentIndex(max(0, index))
+        return combo
+
+    @staticmethod
+    def _slider(
+        minimum: int, maximum: int, value: int, suffix: str
+    ) -> tuple[QSlider, QLabel, QWidget]:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(minimum, maximum)
+        with QSignalBlocker(slider):
+            slider.setValue(value)
+        label = QLabel(f"{slider.value()}{suffix}")
+        label.setMinimumWidth(43)
+        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        slider.valueChanged.connect(
+            lambda number: label.setText(f"{number}{suffix}")
+        )
+        layout.addWidget(slider, 1)
+        layout.addWidget(label)
+        return slider, label, row
+
+    def _combo_changed(
+        self, control: QComboBox, section: str, field: str
+    ) -> None:
+        if control.currentIndex() >= 0:
+            self._change(section, field, control.currentData())
+
+    def _change(self, section: str, field: str, value: object) -> None:
+        target = getattr(self._settings, section)
+        if getattr(target, field) == value:
+            return
+        setattr(target, field, value)
+        if section == "display" and field == "style":
+            self._update_opacity_enabled()
+        self.settingsChanged.emit(copy.deepcopy(self._settings))
+
+    def _update_opacity_enabled(self) -> None:
+        enabled = self._settings.display.style == "box"
+        self.opacity_slider.setEnabled(enabled)
+        self.opacity_value.setEnabled(enabled)
+
+    def _set_advanced(self, expanded: bool) -> None:
+        self.advanced_button.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.advanced_group.setVisible(expanded)
+        self.layout().activate()
+        self.resize(self.width(), self.sizeHint().height())
+
+    def _refresh_screens(self, *_: object) -> None:
+        for screen in self._watched_screens:
+            try:
+                screen.geometryChanged.disconnect(self._refresh_screens)
+            except (RuntimeError, TypeError):
+                pass
+        self._watched_screens = list(QGuiApplication.screens())
+        with QSignalBlocker(self.screen_combo):
+            self.screen_combo.clear()
+            for index, screen in enumerate(self._watched_screens):
+                geo = screen.geometry()
+                name = screen.name() or f"螢幕 {index + 1}"
+                self.screen_combo.addItem(
+                    f"{name}（{geo.width()} × {geo.height()}）", index
+                )
+            selected = self.screen_combo.findData(self._settings.display.screen)
+            if selected < 0:
+                primary = QGuiApplication.primaryScreen()
+                selected = next(
+                    (i for i, screen in enumerate(self._watched_screens)
+                     if screen is primary),
+                    -1,
+                )
+            self.screen_combo.setCurrentIndex(selected)
+        for screen in self._watched_screens:
+            screen.geometryChanged.connect(self._refresh_screens)
+
+    def set_devices(self, devices: list[str], current: str) -> None:
+        names = list(dict.fromkeys(name for name in devices if name))
+        if current and current not in names:
+            names.append(current)
+        with QSignalBlocker(self.device_combo):
+            self.device_combo.clear()
+            self.device_combo.addItem("系統預設", "")
+            for name in names:
+                self.device_combo.addItem(name, name)
+            self.device_combo.setCurrentIndex(self.device_combo.findData(current))
+        self._settings.audio.device = current
+
+    def set_status(self, status: PipelineStatus) -> None:
+        self._status = status
+        busy = status.state in (PipelineState.LOADING, PipelineState.STOPPING)
+        with QSignalBlocker(self.start_button):
+            self.start_button.setText(
+                "停止" if status.running or status.state == PipelineState.STOPPING
+                else "開始"
+            )
+            self.start_button.setEnabled(not busy)
+
+        parts = [STATE_LABELS[status.state]]
+        if status.profile_label:
+            parts.append(status.profile_label)
+        if status.latency_s is not None and math.isfinite(status.latency_s):
+            parts.append(f"延遲 {max(0.0, status.latency_s):.1f} 秒")
+        if status.segmented:
+            parts.append("分段字幕")
+        self.status_label.setText(" · ".join(parts))
+        self.warning_label.setText(status.message)
+        self.warning_label.setVisible(bool(status.message))
+        level = status.level if math.isfinite(status.level) else 0.0
+        with QSignalBlocker(self.level_bar):
+            self.level_bar.setValue(round(max(0.0, min(1.0, level)) * 100))
+
+    def set_hotkey_ok(self, ok: bool) -> None:
+        self.hotkey_label.setText(
+            "Ctrl+Alt+H 顯示/隱藏面板 · Ctrl+Alt+S 開始/停止"
+            if ok else "全域熱鍵註冊失敗，請用系統匣叫回面板"
+        )
+
+    def _start_stop(self) -> None:
+        if self._status.state in (PipelineState.LOADING, PipelineState.STOPPING):
+            return
+        if self._status.running:
+            self.stopRequested.emit()
+        else:
+            self.startRequested.emit()
+
+    def _hide_panel(self) -> None:
+        if self.can_hide:
+            self.hide()
+            self.hideRequested.emit()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.can_hide:
+            event.ignore()
+            self._hide_panel()
+        else:
+            event.accept()
+            self.quitRequested.emit()
+=====END
+
+=====FILE: src/livesub/ui/tray.py
+"""不依賴外部圖片的系統匣圖示。"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import QObject, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+from .theme import PANEL_QSS
+
+
+class TrayIcon(QSystemTrayIcon):
+    toggleRequested = Signal()
+    startStopRequested = Signal()
+    quitRequested = Signal()
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self.setIcon(self._make_icon())
+        self.setToolTip("即時字幕")
+
+        self._menu = QMenu()
+        self._menu.setStyleSheet(PANEL_QSS)
+        toggle_action = self._menu.addAction("顯示/隱藏面板")
+        toggle_action.triggered.connect(self.toggleRequested.emit)
+        self._start_action = self._menu.addAction("開始")
+        self._start_action.triggered.connect(self.startStopRequested.emit)
+        self._menu.addSeparator()
+        quit_action = self._menu.addAction("結束")
+        quit_action.triggered.connect(self.quitRequested.emit)
+
+        self.setContextMenu(self._menu)
+        self.activated.connect(self._activated)
+        self.destroyed.connect(self._menu.deleteLater)
+
+    @staticmethod
+    def _make_icon() -> QIcon:
+        icon = QIcon()
+        for size in (16, 24, 32, 48, 64):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.scale(size / 32, size / 32)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#306da8"))
+            painter.drawRoundedRect(QRectF(1, 3, 30, 26), 6, 6)
+
+            pen = QPen(QColor("white"))
+            pen.setWidthF(2.5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(7, 12, 25, 12)
+            painter.drawLine(7, 20, 15, 20)
+            painter.drawLine(20, 20, 25, 20)
+            painter.end()
+            icon.addPixmap(pixmap)
+        return icon
+
+    def set_running(self, running: bool) -> None:
+        self._start_action.setText("停止" if running else "開始")
+
+    def _activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggleRequested.emit()
+=====END
+
+=====FILE: tests/test_ui_overlay.py
+from __future__ import annotations
+
+import os
+from dataclasses import replace
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtCore import QAbstractAnimation, Qt
+from PySide6.QtGui import QFontMetrics, QGuiApplication
+
+from livesub.config import DisplaySettings
+from livesub.core.captions import Block, BoardSnapshot, Span
+from livesub.ui.overlay import OverlayWindow
+from livesub.ui.theme import OVERLAY_BLOCK_GAP, OVERLAY_PADDING
+
+pytestmark = pytest.mark.gui
+
+
+def snapshot(text: str, bilingual: bool = False, visible: bool = True):
+    blocks = [Block("zh", (Span(text),))]
+    if bilingual:
+        blocks.append(Block("en", (Span("Latest translation", dim=True),)))
+    return BoardSnapshot(tuple(blocks), visible, 1)
+
+
+@pytest.fixture
+def overlay(qtbot):
+    window = OverlayWindow(DisplaySettings())
+    qtbot.addWidget(window)
+    return window
+
+
+def test_flags(overlay):
+    flags = overlay.windowFlags()
+    for flag in (
+        Qt.WindowType.FramelessWindowHint,
+        Qt.WindowType.WindowStaysOnTopHint,
+        Qt.WindowType.WindowTransparentForInput,
+        Qt.WindowType.WindowDoesNotAcceptFocus,
+    ):
+        assert flags & flag
+    assert flags & Qt.WindowType.WindowType_Mask == Qt.WindowType.Tool
+    for attribute in (
+        Qt.WidgetAttribute.WA_TranslucentBackground,
+        Qt.WidgetAttribute.WA_ShowWithoutActivating,
+        Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+    ):
+        assert overlay.testAttribute(attribute)
+
+
+@pytest.mark.parametrize("position", ["top", "bottom"])
+@pytest.mark.parametrize("width_pct,margin,font_size,max_lines", [
+    (30, 0, 16, 1),
+    (80, 40, 36, 2),
+    (100, 75, 64, 3),
+])
+def test_geometry(overlay, position, width_pct, margin, font_size, max_lines):
+    settings = DisplaySettings(
+        position=position,
+        width_pct=width_pct,
+        margin_px=margin,
+        font_size=font_size,
+        max_lines=max_lines,
+    )
+    overlay.apply_settings(settings)
+    screen = QGuiApplication.screens()[settings.screen].geometry()
+    actual = overlay.target_geometry()
+    expected_height = (
+        max_lines * QFontMetrics(overlay.font()).lineSpacing()
+        + 2 * OVERLAY_PADDING
+    )
+    assert actual.width() == round(screen.width() * width_pct / 100)
+    assert actual.x() == screen.left() + (screen.width() - actual.width()) // 2
+    assert actual.height() == expected_height
+    expected_y = (
+        screen.top() + margin
+        if position == "top"
+        else screen.bottom() - margin - expected_height
+    )
+    assert actual.y() == expected_y
+    assert overlay.geometry() == actual
+
+
+def test_height_depends_on_rows_and_blocks(overlay):
+    settings = DisplaySettings(max_lines=1)
+    overlay.apply_settings(settings)
+    line_height = QFontMetrics(overlay.font()).lineSpacing()
+    single = overlay.target_geometry().height()
+
+    overlay.apply_settings(replace(settings, max_lines=3))
+    assert overlay.target_geometry().height() == single + 2 * line_height
+
+    overlay.show_snapshot(snapshot("中文", bilingual=True))
+    assert overlay.target_geometry().height() == (
+        6 * line_height + OVERLAY_BLOCK_GAP + 2 * OVERLAY_PADDING
+    )
+
+    overlay.show_snapshot(snapshot("中文"))
+    assert overlay.target_geometry().height() == 3 * line_height + 2 * OVERLAY_PADDING
+
+
+def test_preallocate_blocks(overlay):
+    overlay.set_block_count(2)
+    before = overlay.target_geometry()
+    overlay.show_snapshot(snapshot("新內容", bilingual=True))
+    assert overlay.target_geometry() == before
+
+
+def test_long_text_keeps_fixed_height_and_tail(overlay):
+    overlay.apply_settings(DisplaySettings(max_lines=2, width_pct=30))
+    overlay.show_snapshot(snapshot("短句"))
+    expected = overlay.target_geometry()
+
+    text = "舊字幕 " * 3000 + "最新內容 😀"
+    overlay.show_snapshot(snapshot(text))
+    assert overlay.target_geometry() == expected
+    assert overlay._paths
+    line_height = QFontMetrics(overlay.font()).lineSpacing()
+    for path, _ in overlay._paths:
+        assert path.boundingRect().top() >= OVERLAY_PADDING - line_height * 0.25
+        assert path.boundingRect().bottom() <= (
+            OVERLAY_PADDING + 2 * line_height + line_height * 0.25
+        )
+    overlay.show()
+    assert not overlay.grab().isNull()
+
+
+def test_out_of_range_screen_uses_primary(overlay):
+    settings = DisplaySettings(screen=999, position="top", margin_px=17)
+    overlay.apply_settings(settings)
+    screen = QGuiApplication.primaryScreen().geometry()
+    result = overlay.target_geometry()
+    assert result.width() == round(screen.width() * settings.width_pct / 100)
+    assert result.x() == screen.left() + (screen.width() - result.width()) // 2
+    assert result.y() == screen.top() + 17
+
+
+def test_visible_false_starts_fade_and_can_reverse(overlay, qtbot):
+    overlay.show_snapshot(snapshot("字幕"))
+    overlay.fade_animation.setCurrentTime(300)
+    assert overlay.windowOpacity() == pytest.approx(1.0, abs=0.01)
+
+    overlay.show_snapshot(snapshot("字幕", visible=False))
+    assert overlay.fade_animation.duration() == 300
+    assert overlay.fade_animation.endValue() == 0.0
+    assert overlay.fade_animation.state() == QAbstractAnimation.State.Running
+
+    qtbot.waitUntil(
+        lambda: overlay.fade_animation.state() == QAbstractAnimation.State.Stopped,
+        timeout=1500,
+    )
+    assert overlay.windowOpacity() == pytest.approx(0.0, abs=0.01)
+    overlay.show_snapshot(snapshot("下一句"))
+    assert overlay.fade_animation.endValue() == 1.0
+    assert overlay.fade_animation.state() == QAbstractAnimation.State.Running
+
+
+def test_empty_box_paints_nothing(overlay):
+    overlay.show_snapshot(BoardSnapshot((Block("zh", (Span("   "),)),), True, 1))
+    assert overlay._paths == []
+    overlay.setWindowOpacity(1.0)
+    image = overlay.grab().toImage()
+    assert image.pixelColor(image.width() // 2, image.height() // 2).alpha() == 0
+
+
+def test_dim_and_unicode_spans(overlay):
+    overlay.show_snapshot(BoardSnapshot(
+        (Block("zh", (Span("😀 正式字幕 "), Span("暫定文字", dim=True))),),
+        True,
+        1,
+    ))
+    assert any(dim for _, dim in overlay._paths)
+    assert any(not dim for _, dim in overlay._paths)
+    assert not overlay.grab().isNull()
+=====END
+
+=====FILE: tests/test_ui_panel.py
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtCore import QSignalBlocker, Qt
+
+from livesub.config import Settings
+from livesub.core.status import PipelineState, PipelineStatus, STATE_LABELS
+from livesub.ui.panel import ControlPanel
+
+pytestmark = pytest.mark.gui
+
+
+@pytest.fixture
+def panel(qtbot):
+    widget = ControlPanel(Settings())
+    qtbot.addWidget(widget)
+    return widget
+
+
+@pytest.mark.parametrize("control,section,field,value", [
+    ("mode_combo", "display", "mode", "original"),
+    ("mode_combo", "display", "mode", "zh"),
+    ("mode_combo", "display", "mode", "en"),
+    ("position_combo", "display", "position", "top"),
+    ("source_combo", "audio", "source_language", "zh"),
+    ("source_combo", "audio", "source_language", "en"),
+    ("style_combo", "display", "style", "outline"),
+])
+def test_combo_settings(panel, qtbot, control, section, field, value):
+    combo = getattr(panel, control)
+    with qtbot.waitSignal(panel.settingsChanged) as emitted:
+        combo.setCurrentIndex(combo.findData(value))
+    settings = emitted.args[0]
+    assert isinstance(settings, Settings)
+    assert getattr(getattr(settings, section), field) == value
+
+
+@pytest.mark.parametrize("control,field,value,expected", [
+    ("font_slider", "font_size", 64, 64),
+    ("opacity_slider", "box_opacity", 37, 0.37),
+    ("lines_spin", "max_lines", 3, 3),
+    ("width_slider", "width_pct", 55, 55),
+])
+def test_numeric_settings(panel, qtbot, control, field, value, expected):
+    with qtbot.waitSignal(panel.settingsChanged) as emitted:
+        getattr(panel, control).setValue(value)
+    assert getattr(emitted.args[0].display, field) == pytest.approx(expected)
+
+
+def test_devices_programmatic_update_and_user_change(panel, qtbot):
+    emissions = []
+    panel.settingsChanged.connect(emissions.append)
+    panel.set_devices(["麥克風 A", "麥克風 B", "麥克風 A"], "麥克風 B")
+    assert emissions == []
+    assert panel.device_combo.count() == 3
+    assert panel.device_combo.itemText(0) == "系統預設"
+    assert panel.device_combo.itemData(0) == ""
+    assert panel.device_combo.currentData() == "麥克風 B"
+
+    with qtbot.waitSignal(panel.settingsChanged) as emitted:
+        panel.device_combo.setCurrentIndex(0)
+    assert emitted.args[0].audio.device == ""
+
+
+def test_missing_current_device_is_preserved(panel):
+    panel.set_devices([], "尚未連接的麥克風")
+    assert panel.device_combo.currentData() == "尚未連接的麥克風"
+
+
+def test_screen_setting_without_second_physical_screen(panel, qtbot):
+    with QSignalBlocker(panel.screen_combo):
+        panel.screen_combo.addItem("測試螢幕（1920 × 1080）", 7)
+    with qtbot.waitSignal(panel.settingsChanged) as emitted:
+        panel.screen_combo.setCurrentIndex(panel.screen_combo.findData(7))
+    assert emitted.args[0].display.screen == 7
+
+
+def test_screen_refresh_does_not_emit(panel):
+    emissions = []
+    panel.settingsChanged.connect(emissions.append)
+    panel._refresh_screens()
+    assert emissions == []
+
+
+def test_status_never_emits_settings(panel):
+    emissions = []
+    panel.settingsChanged.connect(emissions.append)
+    status = PipelineStatus(
+        state=PipelineState.RUNNING,
+        profile_label="CPU 基本",
+        latency_s=1.23,
+        level=0.42,
+        segmented=True,
+        message="已切換備援模型",
+    )
+    panel.set_status(status)
+    assert emissions == []
+    assert STATE_LABELS[status.state] in panel.status_label.text()
+    assert "CPU 基本" in panel.status_label.text()
+    assert "延遲 1.2 秒" in panel.status_label.text()
+    assert "分段字幕" in panel.status_label.text()
+    assert panel.warning_label.text() == "已切換備援模型"
+    assert not panel.warning_label.isHidden()
+    assert panel.level_bar.value() == 42
+
+    panel.set_status(PipelineStatus())
+    assert panel.warning_label.isHidden()
+    assert emissions == []
+
+
+@pytest.mark.parametrize("state,text,enabled", [
+    (PipelineState.IDLE, "開始", True),
+    (PipelineState.LOADING, "停止", False),
+    (PipelineState.RUNNING, "停止", True),
+    (PipelineState.STOPPING, "停止", False),
+    (PipelineState.FAILED, "開始", True),
+])
+def test_start_button_state(panel, state, text, enabled):
+    panel.set_status(PipelineStatus(state=state))
+    assert panel.start_button.text() == text
+    assert panel.start_button.isEnabled() is enabled
+
+
+def test_start_stop_signals(panel, qtbot):
+    with qtbot.waitSignal(panel.startRequested):
+        panel.start_button.click()
+    panel.set_status(PipelineStatus(state=PipelineState.RUNNING))
+    with qtbot.waitSignal(panel.stopRequested):
+        panel.start_button.click()
+
+
+def test_busy_button_does_not_emit(panel):
+    calls = []
+    panel.startRequested.connect(lambda: calls.append("start"))
+    panel.stopRequested.connect(lambda: calls.append("stop"))
+    for state in (PipelineState.LOADING, PipelineState.STOPPING):
+        panel.set_status(PipelineStatus(state=state))
+        panel.start_button.click()
+    assert calls == []
+
+
+def test_settings_are_deep_copies(qtbot):
+    original = Settings()
+    panel = ControlPanel(original)
+    qtbot.addWidget(panel)
+    emissions = []
+    panel.settingsChanged.connect(emissions.append)
+
+    panel.font_slider.setValue(50)
+    first = emissions[-1]
+    panel.font_slider.setValue(60)
+    assert original.display.font_size == 36
+    assert first.display.font_size == 50
+    first.audio.device = "外部修改"
+
+    panel.width_slider.setValue(70)
+    assert emissions[-1].audio.device == ""
+    assert emissions[-1].display.font_size == 60
+
+
+def test_opacity_enabled_only_for_box(panel):
+    panel.style_combo.setCurrentIndex(panel.style_combo.findData("outline"))
+    assert not panel.opacity_slider.isEnabled()
+    panel.style_combo.setCurrentIndex(panel.style_combo.findData("box"))
+    assert panel.opacity_slider.isEnabled()
+
+
+def test_hide_disabled_and_close_quits(qtbot):
+    panel = ControlPanel(Settings(), can_hide=False)
+    qtbot.addWidget(panel)
+    assert not panel.hide_button.isEnabled()
+    assert panel.hide_button.toolTip() == "系統匣與熱鍵都不可用，無法隱藏"
+    panel.show()
+    with qtbot.waitSignal(panel.quitRequested):
+        assert panel.close()
+
+
+def test_hide_button_and_close_hide(panel, qtbot):
+    panel.show()
+    with qtbot.waitSignal(panel.hideRequested):
+        panel.hide_button.click()
+    assert not panel.isVisible()
+
+    panel.show()
+    with qtbot.waitSignal(panel.hideRequested):
+        panel.close()
+    assert not panel.isVisible()
+
+
+def test_hotkey_message(panel):
+    panel.set_hotkey_ok(False)
+    assert panel.hotkey_label.text() == "全域熱鍵註冊失敗，請用系統匣叫回面板"
+    panel.set_hotkey_ok(True)
+    assert "Ctrl+Alt+H" in panel.hotkey_label.text()
+    assert "Ctrl+Alt+S" in panel.hotkey_label.text()
+
+
+def test_advanced_expands_and_collapses(panel, qtbot):
+    panel.show()
+    qtbot.wait(10)
+    assert panel.advanced_group.isHidden()
+    collapsed = panel.height()
+    panel.advanced_button.click()
+    qtbot.wait(10)
+    assert not panel.advanced_group.isHidden()
+    assert panel.height() > collapsed
+    panel.advanced_button.click()
+    qtbot.wait(10)
+    assert panel.advanced_group.isHidden()
+    assert panel.height() <= collapsed
+
+
+def test_panel_is_not_tool_window(panel):
+    assert (
+        panel.windowFlags() & Qt.WindowType.WindowType_Mask
+    ) == Qt.WindowType.Window
+=====END
+
+給 Claude 的整合說明：
+
+- `settingsChanged` 連到設定儲存與 `overlay.apply_settings(settings.display)`；模式改變後請重新送出 snapshot，也可先呼叫 `set_block_count(2 if mode == "bilingual" else 1)`。
+- 連接面板的 `startRequested`、`stopRequested`、`hideRequested`、`quitRequested`，以及系統匣的三個 Signal。建立後由整合層呼叫 `overlay.show()`、`panel.show()`、`tray.show()`。
+- Pipeline 的 snapshot/status 請透過 Qt queued signal 傳到 GUI 執行緒；設定儲存的 0.5 秒防抖由整合層負責。
+- 依指定高度公式，各區塊使用相同字級，未套用 `secondary_scale`。複雜連寫文字跨 Span 的 shaping 不在目前中英文範圍內。
+- 環境政策封鎖執行工具，以上測試尚未實跑；請註冊 `gui` marker，再以 `QT_QPA_PLATFORM=offscreen` 執行這兩個測試檔。實際滑鼠穿透、置頂與淡出效果仍需桌面環境驗證。
